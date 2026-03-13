@@ -1,0 +1,36 @@
+name: "Add package pre-release info to PR"
+description: "Prepends a package's pre-release info to a PR."
+
+inputs:
+  package-name:
+    description: "The name of the NPM package"
+    required: true
+  version:
+    description: "The pre-release version"
+    required: true
+  github-token:
+    description: "A GitHub token with pull-request write access"
+    required: true
+  pr-number:
+    description: "The Pull Request number"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: latest
+
+    - name: Run script
+      shell: bash # Required in composite actions for 'run' steps
+      env:
+        # Map inputs and context to environment variables
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        PACKAGE_NAME: ${{ inputs.package-name }}
+        PACKAGE_VERSION: ${{ inputs.version }}
+      # Use github.action_path to locate the script inside the action's folder
+      run: bun run ${{ github.action_path }}/add-package-pre-release-info-to-pr.ts
