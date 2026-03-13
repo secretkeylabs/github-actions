@@ -23,6 +23,14 @@ runs:
       with:
         bun-version: latest
 
+    - name: Install action dependencies
+      shell: bash
+      # 1. Change directory to the action's hidden folder
+      # 2. Run the install (creates node_modules INSIDE the action folder)
+      run: |
+        cd ${{ github.action_path }}
+        bun install --frozen-lockfile
+
     - name: Run script
       shell: bash # Required in composite actions for 'run' steps
       env:
