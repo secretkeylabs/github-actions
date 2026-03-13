@@ -1,0 +1,14 @@
+{
+  "name": "add-package-pre-release-info-to-pr",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "octokit": "5.0.5",
+    "prettier": "3.8.1"
+  }
+}

@@ -1,3 +1,5 @@
+import { Octokit } from "octokit";
+
 const token = process.env.GITHUB_TOKEN;
 const repoFullName = process.env.GITHUB_REPOSITORY;
 const prNumber = process.env.PR_NUMBER;
@@ -8,6 +10,8 @@ if (!token || !repoFullName || !prNumber || !packageName || !version) {
   console.error("Missing required environment variables.");
   process.exit(1);
 }
+
+const [owner, repo] = repoFullName.split("/") as [string, string];
 
 const startMarker = "<" + "!-- package-pre-release-info-start --" + ">";
 const endMarker = "<" + "!-- package-pre-release-info-end --" + ">";
@@ -26,20 +30,16 @@ bun install ${packageName}@${version} -E
 ---
 ${endMarker}`;
 
-const apiUrl = `https://api.github.com/repos/${repoFullName}/pulls/${prNumber}`;
-const headers = {
-  Accept: "application/vnd.github.v3+json",
-  Authorization: `Bearer ${token}`,
-  "X-GitHub-Api-Version": "2022-11-28",
-  "Content-Type": "application/json",
-};
+const octokit = new Octokit({ auth: token });
 
 async function updatePullRequest() {
   try {
-    const getRes = await fetch(apiUrl, { headers });
-    if (!getRes.ok) throw new Error(`Failed to fetch PR: ${getRes.statusText}`);
+    const { data: pr } = await octokit.rest.pulls.get({
+      owner,
+      repo,
+      pull_number: Number(prNumber),
+    });
 
-    const pr = await getRes.json();
     let body = pr.body || "";
 
     const regex = new RegExp(`${startMarker}[\\s\\S]*?${endMarker}\\s*`);
@@ -55,14 +55,12 @@ async function updatePullRequest() {
       console.log(`Prepended new info block to PR #${prNumber}.`);
     }
 
-    const patchRes = await fetch(apiUrl, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify({ body }),
+    await octokit.rest.pulls.update({
+      owner,
+      repo,
+      pull_number: Number(prNumber),
+      body,
     });
-
-    if (!patchRes.ok)
-      throw new Error(`Failed to update PR: ${patchRes.statusText}`);
 
     console.log(
       `Successfully added package pre-release info to PR #${prNumber}.`,
