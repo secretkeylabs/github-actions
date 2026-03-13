@@ -25,6 +25,6 @@ Prepends a package's pre-release installation instructions to a Pull Request des
 | Input          | Description                                   | Required |
 | -------------- | --------------------------------------------- | -------- |
 | `package-name` | The name of the NPM package                   | Yes      |
-| `version`      | The pre-release version                        | Yes      |
-| `github-token` | A GitHub token with pull-request write access  | Yes      |
-| `pr-number`    | The Pull Request number                        | Yes      |
+| `version`      | The pre-release version                       | Yes      |
+| `github-token` | A GitHub token with pull-request write access | Yes      |
+| `pr-number`    | The Pull Request number                       | Yes      |
