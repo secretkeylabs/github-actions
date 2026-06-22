@@ -4,6 +4,23 @@ Reusable GitHub Actions for the [`secretkeylabs`](https://github.com/secretkeyla
 
 ## Actions
 
+### `check-agents`
+
+Checks that a repository has a root `AGENTS.md` file and that it links to every nested `AGENTS.md` file.
+
+#### Usage
+
+```yaml
+- name: Check AGENTS.md links
+  uses: secretkeylabs/github-actions/check-agents@main
+```
+
+#### Inputs
+
+| Input               | Description                                             | Required | Default |
+| ------------------- | ------------------------------------------------------- | -------- | ------- |
+| `working-directory` | Directory to check, relative to the workflow workspace. | No       | `.`     |
+
 ### `add-package-pre-release-info-to-pr`
 
 Prepends a package's pre-release installation instructions to a Pull Request description. If the PR already contains a pre-release info block, it is updated in place.
