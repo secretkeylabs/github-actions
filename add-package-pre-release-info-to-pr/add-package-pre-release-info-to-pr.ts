@@ -16,8 +16,12 @@ const [owner, repo] = repoFullName.split("/") as [string, string];
 const startMarker = "<" + "!-- package-pre-release-info-start --" + ">";
 const endMarker = "<" + "!-- package-pre-release-info-end --" + ">";
 
+const timestamp = new Date().toISOString();
+
 const infoText = `${startMarker}
 ### Package pre-release info
+
+Built at (UTC): ${timestamp}
 
 \`\`\`bash
 npm install ${packageName}@${version} -E
