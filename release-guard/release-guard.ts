@@ -216,11 +216,25 @@ const mergeBaseWith = memo(
   },
 );
 
-async function changedMergeBase(headSha: string, before?: string, after?: string): Promise<boolean> {
-  if (!before || !after || /^0+$/.test(before) || /^0+$/.test(after)) return true;
-  const [a, b] = [await mergeBaseWith(headSha, before), await mergeBaseWith(headSha, after)];
-  // When either side can't be resolved, assume the comparison changed.
-  return !a || !b || a !== b;
+// Integrations come newest first. The merge base of the head with the base branch only moves forward along a linear
+// history, so the integrations that left it unchanged form a prefix: binary search for the first one whose `before`
+// tip has another merge base than the newest tip, instead of comparing every earlier integration (one comparison per
+// integration and PR does not scale to many parallel release fixes). Entries without usable tips count as changed.
+async function firstMergeBaseChange(headSha: string, items: { before?: string; after?: string }[]): Promise<number> {
+  const usable = (e: { before?: string; after?: string }) => !!e.before && !!e.after && !/^0+$/.test(e.before) && !/^0+$/.test(e.after);
+  let n = items.findIndex((e) => !usable(e));
+  if (n === -1) n = items.length;
+  if (n === 0) return 0;
+  const newest = await mergeBaseWith(headSha, items[0]!.after!);
+  // When the newest tip can't be resolved, assume the comparison changed.
+  if (!newest) return 0;
+  let [lo, hi] = [0, n];
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((await mergeBaseWith(headSha, items[mid]!.before!)) === newest) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }
 
 async function lastBaseChange(prNum: number, baseRef: string, headSha: string, until?: string, ownMergeSha?: string): Promise<number> {
@@ -238,19 +252,27 @@ async function lastBaseChange(prNum: number, baseRef: string, headSha: string, u
     // /activity paginates with cursors, not `page`, so ghPaged would refetch the first page forever. Entries come newest
     // first: follow the next-page link until one at or before the limit shows up, which is then the latest in range.
     let url: string | undefined = `/activity?ref=${ref}&activity_type=${type}&direction=desc&per_page=${until || integration ? 100 : 1}`;
+    const candidates: { timestamp?: string; before?: string; after?: string }[] = [];
     while (url) {
       const page: { items: { timestamp?: string; before?: string; after?: string }[]; next?: string } = await ghPage(url);
       let found = false;
       for (const e of page.items) {
         if (!e.timestamp || Date.parse(e.timestamp) > limit) continue;
         if ((type === "pr_merge" || type === "merge_queue_merge") && ownMergeSha && e.after === ownMergeSha) continue;
-        if (integration && !(await changedMergeBase(headSha, e.before, e.after))) continue;
+        if (integration) {
+          candidates.push(e);
+          continue;
+        }
         last = Math.max(last, Date.parse(e.timestamp));
         found = true;
         break;
       }
       if (found) break;
       url = until || integration ? page.next : undefined;
+    }
+    if (integration && candidates.length) {
+      const changed = candidates[await firstMergeBaseChange(headSha, candidates)];
+      if (changed) last = Math.max(last, Date.parse(changed.timestamp!));
     }
   }
   return last;
@@ -342,6 +364,11 @@ async function isReviewedContent(sha: string, pr: Pull, releaseHead: string): Pr
     // GitHub caps this endpoint at 250 commits, so absence from a full list proves nothing. In that case fall back to
     // history: the commit must be in the approved head's ancestry (the caller already checked that the PR is associated).
     if (prCommits.length < 250 || !(await isAncestorOrSame(sha, pr.head.sha))) return false;
+    // A commit already in the base the PR was merged into was not part of the approved comparison, even though it is
+    // an ancestor of the head: it must have been introduced relative to the integration commit's first parent.
+    if (!pr.merge_commit_sha) return false;
+    const mergeParent = (await gh<Commit>(`/commits/${pr.merge_commit_sha}`)).parents[0]?.sha;
+    if (!mergeParent || (await isAncestorOrSame(sha, mergeParent))) return false;
   }
   // Reachability of the approved head alone is not enough: a branch reset to an earlier snapshot can make the head
   // reachable again through unrelated commits. The merge GitHub made of the approved head is the approved integration
