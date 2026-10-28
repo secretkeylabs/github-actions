@@ -65,7 +65,7 @@ type Pull = {
   state: string;
   merged_at: string | null;
   merge_commit_sha: string | null;
-  base: { ref: string };
+  base: { ref: string; sha: string };
   head: { ref: string; sha: string };
 };
 type Commit = {
@@ -231,6 +231,24 @@ async function isReviewedContent(sha: string, pr: Pull, releaseHead: string): Pr
   if (pr.merge_commit_sha === sha) {
     const c = await gh<Commit>(`/commits/${sha}`);
     if (c.committer?.login === "web-flow" && c.commit.verification?.verified === true) return true;
+  }
+  // A merge inside the PR (e.g. updating the branch) must not make other history reachable: its ignored parents have
+  // to be trusted (on a source branch) or already part of the branch the PR was merged into. Otherwise an `ours` merge
+  // could pull an earlier snapshot of an approved PR back into the release.
+  const own = await gh<Commit>(`/commits/${sha}`);
+  if (own.parents.length > 1) {
+    const baseTips = [pr.base.sha];
+    if (pr.merge_commit_sha) {
+      const m = await gh<Commit>(`/commits/${pr.merge_commit_sha}`);
+      if (m.parents[0]) baseTips.push(m.parents[0].sha);
+    }
+    for (const parent of own.parents.slice(1)) {
+      let trusted = await isOnSource(parent.sha);
+      for (const tip of baseTips) {
+        if (!trusted) trusted = await isAncestorOrSame(parent.sha, tip);
+      }
+      if (!trusted) return false;
+    }
   }
   const prCommits = await prCommitsOf(pr.number);
   if (!prCommits.some((c) => c.sha === sha)) {
