@@ -37,6 +37,8 @@ runs:
 
     - name: Run release guard
       shell: bash
+      # Run from the action directory, not the caller's checkout, so its bunfig.toml (preloads) is never loaded.
+      working-directory: ${{ github.action_path }}
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}
         PR_NUMBER: ${{ inputs.pr-number }}
@@ -45,4 +47,4 @@ runs:
         SOURCE_BRANCHES: ${{ inputs.source-branches }}
         ALLOWED_BOT_CHANGES: ${{ inputs.allowed-bot-changes }}
         EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
-      run: bun run ${{ github.action_path }}/release-guard.ts
+      run: bun run release-guard.ts

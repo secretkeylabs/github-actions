@@ -72,6 +72,7 @@ type Commit = {
   sha: string;
   parents: { sha: string }[];
   author: { login: string } | null;
+  committer: { login: string } | null;
   commit: { message: string; verification?: { verified: boolean; reason: string } };
   files?: { filename: string; status: string; patch?: string }[];
 };
@@ -115,12 +116,40 @@ async function commitsNotOnSources(head: string): Promise<Commit[]> {
   return [...(remaining ?? new Map()).values()];
 }
 
+const writeAccess = new Map<string, Promise<boolean>>();
+// Only reviewers with write access count: GitHub accepts approvals from anyone, but they don't satisfy branch protection.
+function canWrite(login: string): Promise<boolean> {
+  let cached = writeAccess.get(login);
+  if (!cached) {
+    cached = gh<{ permission: string }>(`/collaborators/${encodeURIComponent(login)}/permission`)
+      .then((p) => p.permission === "admin" || p.permission === "write")
+      .catch(() => false);
+    writeAccess.set(login, cached);
+  }
+  return cached;
+}
+
+// True when each reviewer's latest decision is considered, no change request is outstanding and an authorized
+// reviewer's latest decision is an approval of `headSha`.
+async function approvedAtCommit(prNum: number, headSha: string): Promise<boolean> {
+  const latest = new Map<string, Review>();
+  for (const r of await ghPaged<Review>(`/pulls/${prNum}/reviews`)) {
+    if (!r.user || (r.state !== "APPROVED" && r.state !== "CHANGES_REQUESTED" && r.state !== "DISMISSED")) continue;
+    latest.set(r.user.login, r);
+  }
+  const states = [...latest.values()];
+  if (states.some((r) => r.state === "CHANGES_REQUESTED")) return false;
+  for (const r of states) {
+    if (r.state === "APPROVED" && r.commit_id === headSha && (await canWrite(r.user!.login))) return true;
+  }
+  return false;
+}
+
 async function reviewedIntoBranch(sha: string, branch: string): Promise<number | null> {
   const pulls = await gh<Pull[]>(`/commits/${sha}/pulls`);
   for (const pr of pulls) {
     if (!pr.merged_at || pr.base.ref !== branch) continue;
-    const reviews = await ghPaged<Review>(`/pulls/${pr.number}/reviews`);
-    if (reviews.some((r) => r.state === "APPROVED")) return pr.number;
+    if (await approvedAtCommit(pr.number, pr.head.sha)) return pr.number;
   }
   return null;
 }
@@ -129,6 +158,7 @@ async function reviewedIntoBranch(sha: string, branch: string): Promise<number |
 async function botCommitProblems(sha: string): Promise<string[]> {
   const c = await gh<Commit>(`/commits/${sha}`);
   if (c.author?.login !== BOT_LOGIN) return [`not authored by ${BOT_LOGIN}`];
+  if (c.committer?.login !== BOT_LOGIN) return [`not committed by ${BOT_LOGIN}`];
   if (!c.commit.verification?.verified) {
     return [`signature not verified (${c.commit.verification?.reason ?? "unknown"})`];
   }
@@ -157,19 +187,6 @@ async function botCommitProblems(sha: string): Promise<string[]> {
   return problems;
 }
 
-async function approvedAtHead(pr: Pull): Promise<boolean> {
-  const latest = new Map<string, Review>();
-  for (const r of await ghPaged<Review>(`/pulls/${pr.number}/reviews`)) {
-    if (!r.user || (r.state !== "APPROVED" && r.state !== "CHANGES_REQUESTED" && r.state !== "DISMISSED")) continue;
-    latest.set(r.user.login, r);
-  }
-  const states = [...latest.values()];
-  return (
-    !states.some((r) => r.state === "CHANGES_REQUESTED") &&
-    states.some((r) => r.state === "APPROVED" && r.commit_id === pr.head.sha)
-  );
-}
-
 async function main() {
   const pr = await gh<Pull>(`/pulls/${prNumber}`);
   // A manually started run reports its result on the ref it ran on, so it must be the PR's head.
@@ -181,7 +198,9 @@ async function main() {
   const intoRelease = RELEASE_BRANCH.exec(pr.base.ref);
   const outOfRelease = RELEASE_BRANCH.exec(pr.head.ref);
 
-  if (intoRelease) {
+  if (mode === "rc" && (intoRelease || !outOfRelease)) {
+    failures.push(`PR #${pr.number} (${pr.head.ref} -> ${pr.base.ref}) is not a release PR, refusing to publish an rc`);
+  } else if (intoRelease) {
     // A PR into a release branch: its result must carry the branch's version.
     const ref = pr.merge_commit_sha ?? pr.head.sha;
     const version = await versionAt(ref);
@@ -218,7 +237,7 @@ async function main() {
       );
     }
 
-    if (mode === "rc" && !(await approvedAtHead(pr))) {
+    if (mode === "rc" && !(await approvedAtCommit(pr.number, pr.head.sha))) {
       failures.push(`PR #${pr.number} is not approved at its head commit ${pr.head.sha.slice(0, 8)}`);
     }
   } else {
