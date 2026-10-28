@@ -123,7 +123,11 @@ function canWrite(login: string): Promise<boolean> {
   if (!cached) {
     cached = gh<{ permission: string }>(`/collaborators/${encodeURIComponent(login)}/permission`)
       .then((p) => p.permission === "admin" || p.permission === "write")
-      .catch(() => false);
+      // Only a missing user means "no access"; rate limits and server errors must fail the guard, not drop a veto.
+      .catch((err: Error) => {
+        if (err.message.includes(" -> 404 ")) return false;
+        throw err;
+      });
     writeAccess.set(login, cached);
   }
   return cached;
@@ -148,20 +152,30 @@ async function approvedAtCommit(prNum: number, headSha: string): Promise<boolean
 
 // The approval covers the PR's own commits and the merge GitHub itself made (a verified web-flow commit); a merge
 // commit made any other way can carry changes nobody reviewed, so associated-PR membership alone is not enough.
-async function isReviewedContent(sha: string, pr: Pull): Promise<boolean> {
-  const prCommits = await ghPaged<{ sha: string }>(`/pulls/${pr.number}/commits`);
-  if (prCommits.some((c) => c.sha === sha)) return true;
-  if (pr.merge_commit_sha !== sha) return false;
-  const c = await gh<Commit>(`/commits/${sha}`);
-  return c.committer?.login === "web-flow" && c.commit.verification?.verified === true;
+// An intermediate PR commit counts only while the approved final head is still in the checked history, so resetting
+// the branch to an earlier snapshot of the PR cannot reuse the approval.
+async function isAncestorOrSame(ancestor: string, head: string): Promise<boolean> {
+  if (ancestor === head) return true;
+  const cmp = await gh<{ status: string }>(`/compare/${ancestor}...${head}`);
+  return cmp.status === "ahead" || cmp.status === "identical";
 }
 
-async function reviewedIntoBranch(sha: string, branch: string): Promise<number | null> {
+async function isReviewedContent(sha: string, pr: Pull, releaseHead: string): Promise<boolean> {
+  if (pr.merge_commit_sha === sha) {
+    const c = await gh<Commit>(`/commits/${sha}`);
+    if (c.committer?.login === "web-flow" && c.commit.verification?.verified === true) return true;
+  }
+  const prCommits = await ghPaged<{ sha: string }>(`/pulls/${pr.number}/commits`);
+  if (!prCommits.some((c) => c.sha === sha)) return false;
+  return isAncestorOrSame(pr.head.sha, releaseHead);
+}
+
+async function reviewedIntoBranch(sha: string, branch: string, releaseHead: string): Promise<number | null> {
   const pulls = await gh<Pull[]>(`/commits/${sha}/pulls`);
   for (const pr of pulls) {
     if (!pr.merged_at || pr.base.ref !== branch) continue;
     if (!(await approvedAtCommit(pr.number, pr.head.sha))) continue;
-    if (await isReviewedContent(sha, pr)) return pr.number;
+    if (await isReviewedContent(sha, pr, releaseHead)) return pr.number;
   }
   return null;
 }
@@ -246,7 +260,7 @@ async function main() {
     console.log(`${extra.length} commit(s) on ${pr.head.ref} are not on ${sourceBranches.join(" or ")}`);
     for (const c of extra) {
       const subject = c.commit.message.split("\n")[0];
-      const reviewedIn = await reviewedIntoBranch(c.sha, pr.head.ref);
+      const reviewedIn = await reviewedIntoBranch(c.sha, pr.head.ref, pr.head.sha);
       if (reviewedIn) {
         console.log(`ok  ${c.sha.slice(0, 8)} ${subject} (approved PR #${reviewedIn})`);
         continue;
