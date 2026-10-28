@@ -13,6 +13,7 @@ const sourceBranches = (process.env.SOURCE_BRANCHES || "")
   .map((b) => b.trim())
   .filter(Boolean);
 const allowedBotChangesJson = process.env.ALLOWED_BOT_CHANGES || "{}";
+const expectedHeadSha = process.env.EXPECTED_HEAD_SHA || "";
 
 const BOT_LOGIN = "github-actions[bot]";
 const RELEASE_BRANCH = /^(?:release|hotfix)\/(?:cli-)?v?(\d+\.\d+\.\d+)$/;
@@ -171,6 +172,11 @@ async function approvedAtHead(pr: Pull): Promise<boolean> {
 
 async function main() {
   const pr = await gh<Pull>(`/pulls/${prNumber}`);
+  // A manually started run reports its result on the ref it ran on, so it must be the PR's head.
+  if (expectedHeadSha && pr.head.sha !== expectedHeadSha) {
+    console.error(`PR #${pr.number} head is ${pr.head.sha}, but this run checked out ${expectedHeadSha}.`);
+    process.exit(1);
+  }
   const failures: string[] = [];
   const intoRelease = RELEASE_BRANCH.exec(pr.base.ref);
   const outOfRelease = RELEASE_BRANCH.exec(pr.head.ref);

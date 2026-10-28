@@ -19,6 +19,10 @@ inputs:
   source-branches:
     description: "Comma-separated branches whose commits are trusted (e.g. `develop,main`)."
     required: true
+  expected-head-sha:
+    description: "When set, fail unless the PR head is this commit (pass `github.sha` for manually started runs)."
+    required: false
+    default: ""
   allowed-bot-changes:
     description: 'JSON object: file path -> list of regexes every added/removed line of a bot commit must match, e.g. {"package.json": ["^\\s*\"version\": \"[^\"]+\",?$"]}.'
     required: true
@@ -40,4 +44,5 @@ runs:
         VERSION_FILE: ${{ inputs.version-file }}
         SOURCE_BRANCHES: ${{ inputs.source-branches }}
         ALLOWED_BOT_CHANGES: ${{ inputs.allowed-bot-changes }}
+        EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
       run: bun run ${{ github.action_path }}/release-guard.ts
