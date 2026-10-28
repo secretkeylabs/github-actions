@@ -197,11 +197,12 @@ function memo<A extends unknown[], R>(key: (...args: A) => string, fn: (...args:
 
 // When the PR's base was last changed: retargeted to another branch, or its history rewritten (force-push, or the
 // branch deleted and recreated), or a direct push (e.g. a fast-forward) that moved it without a PR merge: that changes
-// the merge base, and so the reviewed diff, while the head stays the same. An approval given before that covers a different comparison (the new base may lack
+// the merge base, and so the reviewed diff, while the head stays the same. Another PR's merge (`pr_merge`) advances
+// the merge base the same way, so it counts too; the checked PR's own merge (`ownMergeSha`) does not. An approval given before that covers a different comparison (the new base may lack
 // commits the reviewer saw as already merged, or the other way round), so it must not count.
 // With `until` (a merged PR's merge time) only changes up to then count: later rewrites of the branch don't undo a
 // review that was already completed into the merge result.
-async function lastBaseChange(prNum: number, baseRef: string, until?: string): Promise<number> {
+async function lastBaseChange(prNum: number, baseRef: string, until?: string, ownMergeSha?: string): Promise<number> {
   const limit = until ? Date.parse(until) : Infinity;
   const events = await ghPaged<{ event: string; created_at?: string }>(`/issues/${prNum}/timeline`);
   let last = 0;
@@ -211,13 +212,13 @@ async function lastBaseChange(prNum: number, baseRef: string, until?: string): P
     if (at <= limit) last = Math.max(last, at);
   }
   const ref = encodeURIComponent(`refs/heads/${baseRef}`);
-  for (const type of ["force_push", "branch_deletion", "branch_creation", "push"]) {
+  for (const type of ["force_push", "branch_deletion", "branch_creation", "push", "pr_merge"]) {
     // /activity paginates with cursors, not `page`, so ghPaged would refetch the first page forever. Entries come newest
     // first: follow the next-page link until one at or before the limit shows up, which is then the latest in range.
     let url: string | undefined = `/activity?ref=${ref}&activity_type=${type}&direction=desc&per_page=${until ? 100 : 1}`;
     while (url) {
-      const page: { items: { timestamp?: string }[]; next?: string } = await ghPage(url);
-      const inRange = page.items.flatMap((e) => (e.timestamp ? [Date.parse(e.timestamp)] : [])).filter((t) => t <= limit);
+      const page: { items: { timestamp?: string; after?: string }[]; next?: string } = await ghPage(url);
+      const inRange = page.items.filter((e) => !(type === "pr_merge" && ownMergeSha && e.after === ownMergeSha)).flatMap((e) => (e.timestamp ? [Date.parse(e.timestamp)] : [])).filter((t) => t <= limit);
       if (inRange.length) {
         last = Math.max(last, ...inRange);
         break;
@@ -229,8 +230,9 @@ async function lastBaseChange(prNum: number, baseRef: string, until?: string): P
 }
 
 const approvedAtCommit = memo(
-  (prNum: number, headSha: string, baseRef: string, mergedAt?: string) => `${prNum}@${headSha}@${baseRef}@${mergedAt ?? ""}`,
-  async (prNum: number, headSha: string, baseRef: string, mergedAt?: string): Promise<boolean> => {
+  (prNum: number, headSha: string, baseRef: string, mergedAt?: string, mergeSha?: string) =>
+    `${prNum}@${headSha}@${baseRef}@${mergedAt ?? ""}@${mergeSha ?? ""}`,
+  async (prNum: number, headSha: string, baseRef: string, mergedAt?: string, mergeSha?: string): Promise<boolean> => {
   const latest = new Map<string, Review>();
   for (const r of await ghPaged<Review>(`/pulls/${prNum}/reviews`)) {
     if (!r.user || (r.state !== "APPROVED" && r.state !== "CHANGES_REQUESTED" && r.state !== "DISMISSED")) continue;
@@ -242,7 +244,7 @@ const approvedAtCommit = memo(
     if (await canWrite(r.user!.login)) states.push(r);
   }
   if (states.some((r) => r.state === "CHANGES_REQUESTED")) return false;
-  const baseChangedAt = await lastBaseChange(prNum, baseRef, mergedAt);
+  const baseChangedAt = await lastBaseChange(prNum, baseRef, mergedAt, mergeSha);
   return states.some(
     (r) =>
       r.state === "APPROVED" &&
@@ -328,7 +330,7 @@ async function reviewedIntoBranch(sha: string, branch: string, releaseHead: stri
   const pulls = await ghPaged<Pull>(`/commits/${sha}/pulls`);
   for (const pr of pulls) {
     if (!pr.merged_at || pr.base.ref !== branch) continue;
-    if (!(await approvedAtCommit(pr.number, pr.head.sha, pr.base.ref, pr.merged_at))) continue;
+    if (!(await approvedAtCommit(pr.number, pr.head.sha, pr.base.ref, pr.merged_at, pr.merge_commit_sha ?? undefined))) continue;
     if (await isReviewedContent(sha, pr, releaseHead)) return pr.number;
   }
   return null;
