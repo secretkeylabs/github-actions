@@ -197,12 +197,33 @@ function memo<A extends unknown[], R>(key: (...args: A) => string, fn: (...args:
 
 // When the PR's base was last changed: retargeted to another branch, or its history rewritten (force-push, or the
 // branch deleted and recreated), or a direct push (e.g. a fast-forward) that moved it without a PR merge: that changes
-// the merge base, and so the reviewed diff, while the head stays the same. Another PR's merge (`pr_merge`) advances
-// the merge base the same way, so it counts too; the checked PR's own merge (`ownMergeSha`) does not. An approval given before that covers a different comparison (the new base may lack
+// the merge base, and so the reviewed diff, while the head stays the same. Another PR's merge (`pr_merge`, `merge_queue_merge`) advances
+// the merge base the same way, so it counts too when it moves the merge base with the head; the checked PR's own merge (`ownMergeSha`) does not. An approval given before that covers a different comparison (the new base may lack
 // commits the reviewer saw as already merged, or the other way round), so it must not count.
 // With `until` (a merged PR's merge time) only changes up to then count: later rewrites of the branch don't undo a
 // review that was already completed into the merge result.
-async function lastBaseChange(prNum: number, baseRef: string, until?: string, ownMergeSha?: string): Promise<number> {
+// An integration (`pr_merge`, `merge_queue_merge`, or a plain `push`) only counts when it moved the merge base between
+// the PR head and the base branch: the reviewed three-dot diff depends on nothing else, so unrelated tip advances (e.g.
+// a sibling release-fix PR merged first) leave the approval valid.
+const mergeBaseWith = memo(
+  (head: string, other: string) => `${other}...${head}`,
+  async (head: string, other: string): Promise<string | undefined> => {
+    try {
+      return (await gh<{ merge_base_commit?: { sha: string } }>(`/compare/${other}...${head}`)).merge_base_commit?.sha;
+    } catch {
+      return undefined;
+    }
+  },
+);
+
+async function changedMergeBase(headSha: string, before?: string, after?: string): Promise<boolean> {
+  if (!before || !after || /^0+$/.test(before) || /^0+$/.test(after)) return true;
+  const [a, b] = [await mergeBaseWith(headSha, before), await mergeBaseWith(headSha, after)];
+  // When either side can't be resolved, assume the comparison changed.
+  return !a || !b || a !== b;
+}
+
+async function lastBaseChange(prNum: number, baseRef: string, headSha: string, until?: string, ownMergeSha?: string): Promise<number> {
   const limit = until ? Date.parse(until) : Infinity;
   const events = await ghPaged<{ event: string; created_at?: string }>(`/issues/${prNum}/timeline`);
   let last = 0;
@@ -212,18 +233,24 @@ async function lastBaseChange(prNum: number, baseRef: string, until?: string, ow
     if (at <= limit) last = Math.max(last, at);
   }
   const ref = encodeURIComponent(`refs/heads/${baseRef}`);
-  for (const type of ["force_push", "branch_deletion", "branch_creation", "push", "pr_merge"]) {
+  for (const type of ["force_push", "branch_deletion", "branch_creation", "push", "pr_merge", "merge_queue_merge"]) {
+    const integration = type === "push" || type === "pr_merge" || type === "merge_queue_merge";
     // /activity paginates with cursors, not `page`, so ghPaged would refetch the first page forever. Entries come newest
     // first: follow the next-page link until one at or before the limit shows up, which is then the latest in range.
-    let url: string | undefined = `/activity?ref=${ref}&activity_type=${type}&direction=desc&per_page=${until ? 100 : 1}`;
+    let url: string | undefined = `/activity?ref=${ref}&activity_type=${type}&direction=desc&per_page=${until || integration ? 100 : 1}`;
     while (url) {
-      const page: { items: { timestamp?: string; after?: string }[]; next?: string } = await ghPage(url);
-      const inRange = page.items.filter((e) => !(type === "pr_merge" && ownMergeSha && e.after === ownMergeSha)).flatMap((e) => (e.timestamp ? [Date.parse(e.timestamp)] : [])).filter((t) => t <= limit);
-      if (inRange.length) {
-        last = Math.max(last, ...inRange);
+      const page: { items: { timestamp?: string; before?: string; after?: string }[]; next?: string } = await ghPage(url);
+      let found = false;
+      for (const e of page.items) {
+        if (!e.timestamp || Date.parse(e.timestamp) > limit) continue;
+        if ((type === "pr_merge" || type === "merge_queue_merge") && ownMergeSha && e.after === ownMergeSha) continue;
+        if (integration && !(await changedMergeBase(headSha, e.before, e.after))) continue;
+        last = Math.max(last, Date.parse(e.timestamp));
+        found = true;
         break;
       }
-      url = until ? page.next : undefined;
+      if (found) break;
+      url = until || integration ? page.next : undefined;
     }
   }
   return last;
@@ -244,7 +271,7 @@ const approvedAtCommit = memo(
     if (await canWrite(r.user!.login)) states.push(r);
   }
   if (states.some((r) => r.state === "CHANGES_REQUESTED")) return false;
-  const baseChangedAt = await lastBaseChange(prNum, baseRef, mergedAt, mergeSha);
+  const baseChangedAt = await lastBaseChange(prNum, baseRef, headSha, mergedAt, mergeSha);
   return states.some(
     (r) =>
       r.state === "APPROVED" &&
