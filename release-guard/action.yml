@@ -1,0 +1,43 @@
+name: "Release guard"
+description: "Fails a release PR or rc publish unless the release branch only adds reviewed commits and verified bot version bumps."
+
+inputs:
+  github-token:
+    description: "Token with contents and pull-requests read access."
+    required: true
+  pr-number:
+    description: "The PR to check: a release PR (from release/* or hotfix/*) or a PR into a release branch."
+    required: true
+  mode:
+    description: "`pr` for the PR check, `rc` to also require an approval at the PR head (before publishing an rc)."
+    required: false
+    default: "pr"
+  version-file:
+    description: "package.json that carries the release version."
+    required: false
+    default: "package.json"
+  source-branches:
+    description: "Comma-separated branches whose commits are trusted (e.g. `develop,main`)."
+    required: true
+  allowed-bot-changes:
+    description: 'JSON object: file path -> list of regexes every added/removed line of a bot commit must match, e.g. {"package.json": ["^\\s*\"version\": \"[^\"]+\",?$"]}.'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      with:
+        bun-version: 1.4.0
+
+    - name: Run release guard
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        GUARD_MODE: ${{ inputs.mode }}
+        VERSION_FILE: ${{ inputs.version-file }}
+        SOURCE_BRANCHES: ${{ inputs.source-branches }}
+        ALLOWED_BOT_CHANGES: ${{ inputs.allowed-bot-changes }}
+      run: bun run ${{ github.action_path }}/release-guard.ts
