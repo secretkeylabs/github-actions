@@ -256,6 +256,11 @@ async function isReviewedContent(sha: string, pr: Pull, releaseHead: string): Pr
     // history: the commit must be in the approved head's ancestry (the caller already checked that the PR is associated).
     if (prCommits.length < 250 || !(await isAncestorOrSame(sha, pr.head.sha))) return false;
   }
+  // Reachability of the approved head alone is not enough: a branch reset to an earlier snapshot can make the head
+  // reachable again through unrelated commits. The merge GitHub made of the approved head is the approved integration
+  // result, and it only exists in history when the branch was not reset to before it.
+  if (!pr.merge_commit_sha) return false;
+  if (!(await isAncestorOrSame(pr.merge_commit_sha, releaseHead))) return false;
   return isAncestorOrSame(pr.head.sha, releaseHead);
 }
 
