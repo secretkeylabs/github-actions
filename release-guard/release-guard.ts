@@ -99,15 +99,21 @@ async function versionAt(ref: string): Promise<string> {
   return json.version;
 }
 
+// A source branch name resolved once to an immutable SHA, so a branch that advances mid-run cannot shift pagination
+// offsets or change what "on a source" means between requests.
+const sourceSha = memo(
+  (source: string) => source,
+  async (source: string): Promise<string> => (await gh<{ sha: string }>(`/commits/${encodeURIComponent(source)}`)).sha,
+);
+
 // Commits on `head` that are not on any trusted source branch.
 async function commitsNotOnSources(head: string): Promise<Commit[]> {
   let remaining: Map<string, Commit> | undefined;
   for (const source of sourceBranches) {
+    const base = await sourceSha(source);
     const ahead = new Map<string, Commit>();
     for (let page = 1; ; page++) {
-      const cmp = await gh<{ commits: Commit[] }>(
-        `/compare/${encodeURIComponent(source)}...${head}?per_page=100&page=${page}`,
-      );
+      const cmp = await gh<{ commits: Commit[] }>(`/compare/${base}...${head}?per_page=100&page=${page}`);
       for (const c of cmp.commits) ahead.set(c.sha, c);
       if (cmp.commits.length < 100) break;
     }
@@ -148,20 +154,28 @@ function memo<A extends unknown[], R>(key: (...args: A) => string, fn: (...args:
   };
 }
 
-// When the PR's base branch was last changed. An approval given before that covers a different comparison (the new
-// base may lack commits the reviewer saw as already merged, or the other way round), so it must not count.
-async function lastBaseChange(prNum: number): Promise<number> {
+// When the PR's base was last changed: retargeted to another branch, or its history rewritten (force-push, or the
+// branch deleted and recreated). An approval given before that covers a different comparison (the new base may lack
+// commits the reviewer saw as already merged, or the other way round), so it must not count.
+async function lastBaseChange(prNum: number, baseRef: string): Promise<number> {
   const events = await ghPaged<{ event: string; created_at?: string }>(`/issues/${prNum}/timeline`);
   let last = 0;
   for (const e of events) {
     if (e.event === "base_ref_changed" && e.created_at) last = Math.max(last, Date.parse(e.created_at));
   }
+  const ref = encodeURIComponent(`refs/heads/${baseRef}`);
+  for (const type of ["force_push", "branch_deletion", "branch_creation"]) {
+    const activities = await ghPaged<{ timestamp?: string }>(`/activity?ref=${ref}&activity_type=${type}`);
+    for (const a of activities) {
+      if (a.timestamp) last = Math.max(last, Date.parse(a.timestamp));
+    }
+  }
   return last;
 }
 
 const approvedAtCommit = memo(
-  (prNum: number, headSha: string) => `${prNum}@${headSha}`,
-  async (prNum: number, headSha: string): Promise<boolean> => {
+  (prNum: number, headSha: string, baseRef: string) => `${prNum}@${headSha}@${baseRef}`,
+  async (prNum: number, headSha: string, baseRef: string): Promise<boolean> => {
   const latest = new Map<string, Review>();
   for (const r of await ghPaged<Review>(`/pulls/${prNum}/reviews`)) {
     if (!r.user || (r.state !== "APPROVED" && r.state !== "CHANGES_REQUESTED" && r.state !== "DISMISSED")) continue;
@@ -173,7 +187,7 @@ const approvedAtCommit = memo(
     if (await canWrite(r.user!.login)) states.push(r);
   }
   if (states.some((r) => r.state === "CHANGES_REQUESTED")) return false;
-  const baseChangedAt = await lastBaseChange(prNum);
+  const baseChangedAt = await lastBaseChange(prNum, baseRef);
   return states.some(
     (r) =>
       r.state === "APPROVED" &&
@@ -219,7 +233,7 @@ async function reviewedIntoBranch(sha: string, branch: string, releaseHead: stri
   const pulls = await ghPaged<Pull>(`/commits/${sha}/pulls`);
   for (const pr of pulls) {
     if (!pr.merged_at || pr.base.ref !== branch) continue;
-    if (!(await approvedAtCommit(pr.number, pr.head.sha))) continue;
+    if (!(await approvedAtCommit(pr.number, pr.head.sha, pr.base.ref))) continue;
     if (await isReviewedContent(sha, pr, releaseHead)) return pr.number;
   }
   return null;
@@ -227,7 +241,7 @@ async function reviewedIntoBranch(sha: string, branch: string, releaseHead: stri
 
 async function isOnSource(sha: string): Promise<boolean> {
   for (const source of sourceBranches) {
-    if (await isAncestorOrSame(sha, source)) return true;
+    if (await isAncestorOrSame(sha, await sourceSha(source))) return true;
   }
   return false;
 }
@@ -333,7 +347,7 @@ async function main() {
       );
     }
 
-    if (mode === "rc" && !(await approvedAtCommit(pr.number, pr.head.sha))) {
+    if (mode === "rc" && !(await approvedAtCommit(pr.number, pr.head.sha, pr.base.ref))) {
       failures.push(`PR #${pr.number} is not approved at its head commit ${pr.head.sha.slice(0, 8)}`);
     }
   } else {
