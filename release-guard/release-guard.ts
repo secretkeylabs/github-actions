@@ -157,25 +157,37 @@ function memo<A extends unknown[], R>(key: (...args: A) => string, fn: (...args:
 // When the PR's base was last changed: retargeted to another branch, or its history rewritten (force-push, or the
 // branch deleted and recreated). An approval given before that covers a different comparison (the new base may lack
 // commits the reviewer saw as already merged, or the other way round), so it must not count.
-async function lastBaseChange(prNum: number, baseRef: string): Promise<number> {
+// With `until` (a merged PR's merge time) only changes up to then count: later rewrites of the branch don't undo a
+// review that was already completed into the merge result.
+async function lastBaseChange(prNum: number, baseRef: string, until?: string): Promise<number> {
+  const limit = until ? Date.parse(until) : Infinity;
   const events = await ghPaged<{ event: string; created_at?: string }>(`/issues/${prNum}/timeline`);
   let last = 0;
   for (const e of events) {
-    if (e.event === "base_ref_changed" && e.created_at) last = Math.max(last, Date.parse(e.created_at));
+    if (e.event !== "base_ref_changed" || !e.created_at) continue;
+    const at = Date.parse(e.created_at);
+    if (at <= limit) last = Math.max(last, at);
   }
   const ref = encodeURIComponent(`refs/heads/${baseRef}`);
   for (const type of ["force_push", "branch_deletion", "branch_creation"]) {
-    // /activity paginates with cursors, not `page`, so ghPaged would refetch the first page forever. Only the newest
-    // entry per type is needed (newest first by default).
-    const [newest] = await gh<{ timestamp?: string }[]>(`/activity?ref=${ref}&activity_type=${type}&direction=desc&per_page=1`);
-    if (newest?.timestamp) last = Math.max(last, Date.parse(newest.timestamp));
+    // /activity paginates with cursors, not `page`, so ghPaged would refetch the first page forever. Take the newest
+    // page (newest first) and pick the latest entry at or before the limit.
+    const perPage = until ? 100 : 1;
+    const entries = await gh<{ timestamp?: string }[]>(`/activity?ref=${ref}&activity_type=${type}&direction=desc&per_page=${perPage}`);
+    const times = entries.flatMap((e) => (e.timestamp ? [Date.parse(e.timestamp)] : []));
+    const inRange = times.filter((t) => t <= limit);
+    // A full page that is entirely newer than the limit may hide an older in-range entry: fail rather than guess.
+    if (until && !inRange.length && entries.length === perPage) {
+      throw new Error(`Cannot find the last ${type} on ${baseRef} before ${until}: more than ${perPage} later events`);
+    }
+    if (inRange.length) last = Math.max(last, ...inRange);
   }
   return last;
 }
 
 const approvedAtCommit = memo(
-  (prNum: number, headSha: string, baseRef: string) => `${prNum}@${headSha}@${baseRef}`,
-  async (prNum: number, headSha: string, baseRef: string): Promise<boolean> => {
+  (prNum: number, headSha: string, baseRef: string, mergedAt?: string) => `${prNum}@${headSha}@${baseRef}@${mergedAt ?? ""}`,
+  async (prNum: number, headSha: string, baseRef: string, mergedAt?: string): Promise<boolean> => {
   const latest = new Map<string, Review>();
   for (const r of await ghPaged<Review>(`/pulls/${prNum}/reviews`)) {
     if (!r.user || (r.state !== "APPROVED" && r.state !== "CHANGES_REQUESTED" && r.state !== "DISMISSED")) continue;
@@ -187,7 +199,7 @@ const approvedAtCommit = memo(
     if (await canWrite(r.user!.login)) states.push(r);
   }
   if (states.some((r) => r.state === "CHANGES_REQUESTED")) return false;
-  const baseChangedAt = await lastBaseChange(prNum, baseRef);
+  const baseChangedAt = await lastBaseChange(prNum, baseRef, mergedAt);
   return states.some(
     (r) =>
       r.state === "APPROVED" &&
@@ -233,7 +245,7 @@ async function reviewedIntoBranch(sha: string, branch: string, releaseHead: stri
   const pulls = await ghPaged<Pull>(`/commits/${sha}/pulls`);
   for (const pr of pulls) {
     if (!pr.merged_at || pr.base.ref !== branch) continue;
-    if (!(await approvedAtCommit(pr.number, pr.head.sha, pr.base.ref))) continue;
+    if (!(await approvedAtCommit(pr.number, pr.head.sha, pr.base.ref, pr.merged_at))) continue;
     if (await isReviewedContent(sha, pr, releaseHead)) return pr.number;
   }
   return null;
