@@ -20,9 +20,9 @@ inputs:
     description: "Comma-separated branches whose commits are trusted (e.g. `develop,main`)."
     required: true
   expected-head-sha:
-    description: "When set, fail unless the PR head is this commit (pass `github.sha` for manually started runs)."
+    description: "Fail unless the PR head is this commit. Defaults to the head of the triggering pull_request event; required in `rc` mode, so pass `github.sha` for other events."
     required: false
-    default: ""
+    default: ${{ github.event.pull_request.head.sha }}
   allowed-bot-changes:
     description: 'JSON object: file path -> list of regexes every added/removed line of a bot commit must match, e.g. {"package.json": ["^\\s*\"version\": \"[^\"]+\",?$"]}.'
     required: true

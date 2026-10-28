@@ -129,34 +129,54 @@ function canWrite(login: string): Promise<boolean> {
   return cached;
 }
 
-// True when each reviewer's latest decision is considered, no change request is outstanding and an authorized
-// reviewer's latest decision is an approval of `headSha`.
+// True when, among reviewers with write access (each one's latest decision), no change request is outstanding and
+// one has approved `headSha`.
 async function approvedAtCommit(prNum: number, headSha: string): Promise<boolean> {
   const latest = new Map<string, Review>();
   for (const r of await ghPaged<Review>(`/pulls/${prNum}/reviews`)) {
     if (!r.user || (r.state !== "APPROVED" && r.state !== "CHANGES_REQUESTED" && r.state !== "DISMISSED")) continue;
     latest.set(r.user.login, r);
   }
-  const states = [...latest.values()];
-  if (states.some((r) => r.state === "CHANGES_REQUESTED")) return false;
-  for (const r of states) {
-    if (r.state === "APPROVED" && r.commit_id === headSha && (await canWrite(r.user!.login))) return true;
+  // Only reviewers with write access count, for vetoes as well as approvals.
+  const states: Review[] = [];
+  for (const r of latest.values()) {
+    if (await canWrite(r.user!.login)) states.push(r);
   }
-  return false;
+  if (states.some((r) => r.state === "CHANGES_REQUESTED")) return false;
+  return states.some((r) => r.state === "APPROVED" && r.commit_id === headSha);
+}
+
+// The approval covers the PR's own commits and the merge GitHub itself made (a verified web-flow commit); a merge
+// commit made any other way can carry changes nobody reviewed, so associated-PR membership alone is not enough.
+async function isReviewedContent(sha: string, pr: Pull): Promise<boolean> {
+  const prCommits = await ghPaged<{ sha: string }>(`/pulls/${pr.number}/commits`);
+  if (prCommits.some((c) => c.sha === sha)) return true;
+  if (pr.merge_commit_sha !== sha) return false;
+  const c = await gh<Commit>(`/commits/${sha}`);
+  return c.committer?.login === "web-flow" && c.commit.verification?.verified === true;
 }
 
 async function reviewedIntoBranch(sha: string, branch: string): Promise<number | null> {
   const pulls = await gh<Pull[]>(`/commits/${sha}/pulls`);
   for (const pr of pulls) {
     if (!pr.merged_at || pr.base.ref !== branch) continue;
-    if (await approvedAtCommit(pr.number, pr.head.sha)) return pr.number;
+    if (!(await approvedAtCommit(pr.number, pr.head.sha))) continue;
+    if (await isReviewedContent(sha, pr)) return pr.number;
   }
   return null;
 }
 
 // Empty when the commit is a verified bot commit that only touches allowed version lines.
 async function botCommitProblems(sha: string): Promise<string[]> {
-  const c = await gh<Commit>(`/commits/${sha}`);
+  // The commit endpoint paginates `files` (100 per page, 3000 max); inspect all of them.
+  const c = await gh<Commit>(`/commits/${sha}?per_page=100&page=1`);
+  const allFiles = [...(c.files ?? [])];
+  for (let page = 2; allFiles.length >= (page - 1) * 100; page++) {
+    const next = await gh<Commit>(`/commits/${sha}?per_page=100&page=${page}`);
+    allFiles.push(...(next.files ?? []));
+  }
+  if (allFiles.length >= 3000) return ["too many changed files to inspect"];
+  c.files = allFiles;
   if (c.author?.login !== BOT_LOGIN) return [`not authored by ${BOT_LOGIN}`];
   if (c.committer?.login !== BOT_LOGIN) return [`not committed by ${BOT_LOGIN}`];
   if (!c.commit.verification?.verified) {
@@ -188,6 +208,10 @@ async function botCommitProblems(sha: string): Promise<string[]> {
 }
 
 async function main() {
+  if (mode === "rc" && !expectedHeadSha) {
+    console.error("rc mode requires expected-head-sha, so the published revision is the one that was checked.");
+    process.exit(1);
+  }
   const pr = await gh<Pull>(`/pulls/${prNumber}`);
   // A manually started run reports its result on the ref it ran on, so it must be the PR's head.
   if (expectedHeadSha && pr.head.sha !== expectedHeadSha) {

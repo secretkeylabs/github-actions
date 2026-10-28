@@ -54,6 +54,8 @@ Fails a release PR, or an rc publish, unless the release branch is safe to ship:
 - the version file matches the version in the branch name (`release/v1.2.3`, `release/cli-v1.2.3`, `hotfix/v1.2.3`) and is higher than the target branch's version;
 - in `rc` mode, the PR is approved at its head commit.
 
+Allowed-bot-changes patterns are matched per changed line, so anchor them to the exact indentation of the release version (a two-space `"version"` in `package.json`, not any `version` key such as `scripts.version`); a lockfile can't be told apart from dependency versions this way, so don't allow it unless the patterns are that precise. Commits that came in through a PR count as reviewed only if they are the PR's own commits or the verified merge GitHub made (rebase merges are not recognised).
+
 For a PR into a release branch it only checks that the result carries the branch's version.
 
 #### Usage
@@ -67,8 +69,7 @@ For a PR into a release branch it only checks that the result carries the branch
     source-branches: develop,main
     allowed-bot-changes: |
       {
-        "package.json": ["^\\s*\"version\": \"[^\"]+\",?$"],
-        "package-lock.json": ["^\\s*\"version\": \"[^\"]+\",?$"]
+        "package.json": ["^ {2}\"version\": \"\\d+\\.\\d+\\.\\d+\",?$"]
       }
 ```
 
@@ -81,5 +82,5 @@ For a PR into a release branch it only checks that the result carries the branch
 | `mode`                | `pr`, or `rc` to also require an approval at the PR head                                 | No       | `pr`           |
 | `version-file`        | `package.json` carrying the release version                                              | No       | `package.json` |
 | `source-branches`     | Comma-separated trusted branches                                                         | Yes      |                |
-| `expected-head-sha`   | Fail unless the PR head is this commit (pass `github.sha` for manually started runs)    | No       |                |
+| `expected-head-sha`   | Fail unless the PR head is this commit; defaults to the `pull_request` event head, required in `rc` mode (pass `github.sha`) | No | event head |
 | `allowed-bot-changes` | JSON: file path -> regexes every changed line of a bot commit must match                 | Yes      |                |
