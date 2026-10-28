@@ -227,6 +227,21 @@ const prCommitsOf = memo(
   (prNum: number) => ghPaged<{ sha: string }>(`/pulls/${prNum}/commits`),
 );
 
+// The commits reached from `head` by always following the first parent, down to the first commit already on a source
+// branch: the sequence of integrations that were made into the release branch itself.
+const firstParentChain = memo(
+  (head: string) => head,
+  async (head: string): Promise<Set<string>> => {
+    const chain = new Set<string>();
+    let cur: string | undefined = head;
+    while (cur && !chain.has(cur) && !(await isOnSource(cur))) {
+      chain.add(cur);
+      cur = (await gh<Commit>(`/commits/${cur}`)).parents[0]?.sha;
+    }
+    return chain;
+  },
+);
+
 async function isReviewedContent(sha: string, pr: Pull, releaseHead: string): Promise<boolean> {
   if (pr.merge_commit_sha === sha) {
     const c = await gh<Commit>(`/commits/${sha}`);
@@ -260,7 +275,9 @@ async function isReviewedContent(sha: string, pr: Pull, releaseHead: string): Pr
   // reachable again through unrelated commits. The merge GitHub made of the approved head is the approved integration
   // result, and it only exists in history when the branch was not reset to before it.
   if (!pr.merge_commit_sha) return false;
-  if (!(await isAncestorOrSame(pr.merge_commit_sha, releaseHead))) return false;
+  // Reachability through any parent is not enough either: another PR started from that merge commit can pull it back
+  // in through its second parent. The integration result must sit on the release's own first-parent lineage.
+  if (!(await firstParentChain(releaseHead)).has(pr.merge_commit_sha)) return false;
   return isAncestorOrSame(pr.head.sha, releaseHead);
 }
 
