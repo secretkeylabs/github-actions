@@ -165,10 +165,10 @@ async function lastBaseChange(prNum: number, baseRef: string): Promise<number> {
   }
   const ref = encodeURIComponent(`refs/heads/${baseRef}`);
   for (const type of ["force_push", "branch_deletion", "branch_creation"]) {
-    const activities = await ghPaged<{ timestamp?: string }>(`/activity?ref=${ref}&activity_type=${type}`);
-    for (const a of activities) {
-      if (a.timestamp) last = Math.max(last, Date.parse(a.timestamp));
-    }
+    // /activity paginates with cursors, not `page`, so ghPaged would refetch the first page forever. Only the newest
+    // entry per type is needed (newest first by default).
+    const [newest] = await gh<{ timestamp?: string }[]>(`/activity?ref=${ref}&activity_type=${type}&direction=desc&per_page=1`);
+    if (newest?.timestamp) last = Math.max(last, Date.parse(newest.timestamp));
   }
   return last;
 }
