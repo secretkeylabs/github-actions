@@ -50,6 +50,22 @@ async function gh<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+// One page plus the URL of the next one from the Link header (cursor-paginated endpoints have no `page` parameter).
+async function ghPage<T>(path: string): Promise<{ items: T[]; next?: string }> {
+  const res = await fetch(path.startsWith("http") ? path : `${api}${path}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`GET ${path} -> ${res.status} ${await res.text()}`);
+  }
+  const next = /<([^>]+)>;\s*rel="next"/.exec(res.headers.get("link") ?? "")?.[1];
+  return { items: (await res.json()) as T[], next };
+}
+
 async function ghPaged<T>(path: string): Promise<T[]> {
   const all: T[] = [];
   for (let page = 1; ; page++) {
@@ -92,6 +108,25 @@ function compareVersions(a: string, b: string): number {
   return 0;
 }
 
+async function jsonAt(ref: string, file: string): Promise<unknown> {
+  const f = await gh<{ content: string }>(`/contents/${file.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`);
+  return JSON.parse(Buffer.from(f.content, "base64").toString("utf8"));
+}
+
+// Line patterns cannot tell a root property from a nested one, so for JSON files the parsed before/after must be
+// identical except for the root `version` value.
+async function jsonOnlyVersionChanged(file: string, sha: string, parent: string): Promise<boolean> {
+  try {
+    const [before, after] = [await jsonAt(parent, file), await jsonAt(sha, file)] as Record<string, unknown>[];
+    if (typeof before !== "object" || typeof after !== "object" || !before || !after) return false;
+    const { version: bv, ...restBefore } = before;
+    const { version: av, ...restAfter } = after;
+    return typeof bv === "string" && typeof av === "string" && JSON.stringify(restBefore) === JSON.stringify(restAfter);
+  } catch {
+    return false;
+  }
+}
+
 async function versionAt(ref: string): Promise<string> {
   const file = await gh<{ content: string }>(`/contents/${versionFile}?ref=${encodeURIComponent(ref)}`);
   const json = JSON.parse(Buffer.from(file.content, "base64").toString("utf8")) as { version?: string };
@@ -100,10 +135,16 @@ async function versionAt(ref: string): Promise<string> {
 }
 
 // A source branch name resolved once to an immutable SHA, so a branch that advances mid-run cannot shift pagination
-// offsets or change what "on a source" means between requests.
+// offsets or change what "on a source" means between requests. Resolved as a branch ref (not `/commits/{name}`, which
+// also accepts tags): a deleted or renamed trusted branch must fail, not be replaced by a tag of the same name.
 const sourceSha = memo(
   (source: string) => source,
-  async (source: string): Promise<string> => (await gh<{ sha: string }>(`/commits/${encodeURIComponent(source)}`)).sha,
+  async (source: string): Promise<string> => {
+    const path = source.split("/").map(encodeURIComponent).join("/");
+    const ref = await gh<{ ref: string; object: { sha: string } }>(`/git/ref/heads/${path}`);
+    if (ref.ref !== `refs/heads/${source}`) throw new Error(`Trusted source branch "${source}" does not exist`);
+    return ref.object.sha;
+  },
 );
 
 // Commits on `head` that are not on any trusted source branch.
@@ -171,17 +212,18 @@ async function lastBaseChange(prNum: number, baseRef: string, until?: string): P
   }
   const ref = encodeURIComponent(`refs/heads/${baseRef}`);
   for (const type of ["force_push", "branch_deletion", "branch_creation", "push"]) {
-    // /activity paginates with cursors, not `page`, so ghPaged would refetch the first page forever. Take the newest
-    // page (newest first) and pick the latest entry at or before the limit.
-    const perPage = until ? 100 : 1;
-    const entries = await gh<{ timestamp?: string }[]>(`/activity?ref=${ref}&activity_type=${type}&direction=desc&per_page=${perPage}`);
-    const times = entries.flatMap((e) => (e.timestamp ? [Date.parse(e.timestamp)] : []));
-    const inRange = times.filter((t) => t <= limit);
-    // A full page that is entirely newer than the limit may hide an older in-range entry: fail rather than guess.
-    if (until && !inRange.length && entries.length === perPage) {
-      throw new Error(`Cannot find the last ${type} on ${baseRef} before ${until}: more than ${perPage} later events`);
+    // /activity paginates with cursors, not `page`, so ghPaged would refetch the first page forever. Entries come newest
+    // first: follow the next-page link until one at or before the limit shows up, which is then the latest in range.
+    let url: string | undefined = `/activity?ref=${ref}&activity_type=${type}&direction=desc&per_page=${until ? 100 : 1}`;
+    while (url) {
+      const page: { items: { timestamp?: string }[]; next?: string } = await ghPage(url);
+      const inRange = page.items.flatMap((e) => (e.timestamp ? [Date.parse(e.timestamp)] : [])).filter((t) => t <= limit);
+      if (inRange.length) {
+        last = Math.max(last, ...inRange);
+        break;
+      }
+      url = until ? page.next : undefined;
     }
-    if (inRange.length) last = Math.max(last, ...inRange);
   }
   return last;
 }
@@ -341,6 +383,9 @@ async function botCommitProblems(sha: string): Promise<string[]> {
       if (!/^[+-]/.test(line)) continue;
       const body = line.slice(1);
       if (!patterns.some((p) => p.test(body))) problems.push(`${f.filename}: ${line.trim()}`);
+    }
+    if (f.filename.endsWith(".json") && !(await jsonOnlyVersionChanged(f.filename, sha, c.parents[0]!.sha))) {
+      problems.push(`${f.filename}: changes more than the root "version"`);
     }
   }
   return problems;
