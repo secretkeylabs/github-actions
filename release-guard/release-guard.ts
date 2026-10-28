@@ -166,7 +166,11 @@ async function isReviewedContent(sha: string, pr: Pull, releaseHead: string): Pr
     if (c.committer?.login === "web-flow" && c.commit.verification?.verified === true) return true;
   }
   const prCommits = await ghPaged<{ sha: string }>(`/pulls/${pr.number}/commits`);
-  if (!prCommits.some((c) => c.sha === sha)) return false;
+  if (!prCommits.some((c) => c.sha === sha)) {
+    // GitHub caps this endpoint at 250 commits, so absence from a full list proves nothing. In that case fall back to
+    // history: the commit must be in the approved head's ancestry (the caller already checked that the PR is associated).
+    if (prCommits.length < 250 || !(await isAncestorOrSame(sha, pr.head.sha))) return false;
+  }
   return isAncestorOrSame(pr.head.sha, releaseHead);
 }
 
