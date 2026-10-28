@@ -24,7 +24,7 @@ inputs:
     required: false
     default: ${{ github.event.pull_request.head.sha }}
   allowed-bot-changes:
-    description: 'JSON object: file path -> list of regexes every added/removed line of a bot commit must match, e.g. {"package.json": ["^\\s*\"version\": \"[^\"]+\",?$"]}.'
+    description: 'JSON object: file path -> list of regexes every added/removed line of a bot commit must match, e.g. {"package.json": ["^ {2}\"version\": \"\\d+\\.\\d+\\.\\d+\",?$"]}.'
     required: true
 
 runs:
