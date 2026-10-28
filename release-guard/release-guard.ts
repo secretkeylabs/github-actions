@@ -180,6 +180,13 @@ async function reviewedIntoBranch(sha: string, branch: string, releaseHead: stri
   return null;
 }
 
+async function isOnSource(sha: string): Promise<boolean> {
+  for (const source of sourceBranches) {
+    if (await isAncestorOrSame(sha, source)) return true;
+  }
+  return false;
+}
+
 // Empty when the commit is a verified bot commit that only touches allowed version lines.
 async function botCommitProblems(sha: string): Promise<string[]> {
   // The commit endpoint paginates `files` (100 per page, 3000 max); inspect all of them.
@@ -199,7 +206,13 @@ async function botCommitProblems(sha: string): Promise<string[]> {
   const files = c.files ?? [];
   // A merge made with `-s ours` keeps the first parent's tree, so it changes nothing.
   if (c.parents.length > 1) {
-    return files.length ? [`merge commit changes ${files.map((f) => f.filename).join(", ")}`] : [];
+    if (files.length) return [`merge commit changes ${files.map((f) => f.filename).join(", ")}`];
+    // The ignored parents must be trusted history: otherwise the merge could just make an unapproved PR's
+    // final head reachable, which lets earlier snapshots of that PR pass the reviewed-content ancestry check.
+    for (const parent of c.parents.slice(1)) {
+      if (!(await isOnSource(parent.sha))) return [`merge parent ${parent.sha.slice(0, 8)} is not on ${sourceBranches.join(" or ")}`];
+    }
+    return [];
   }
   const problems: string[] = [];
   for (const f of files) {
