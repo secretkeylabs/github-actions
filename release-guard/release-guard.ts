@@ -155,7 +155,8 @@ function memo<A extends unknown[], R>(key: (...args: A) => string, fn: (...args:
 }
 
 // When the PR's base was last changed: retargeted to another branch, or its history rewritten (force-push, or the
-// branch deleted and recreated). An approval given before that covers a different comparison (the new base may lack
+// branch deleted and recreated), or a direct push (e.g. a fast-forward) that moved it without a PR merge: that changes
+// the merge base, and so the reviewed diff, while the head stays the same. An approval given before that covers a different comparison (the new base may lack
 // commits the reviewer saw as already merged, or the other way round), so it must not count.
 // With `until` (a merged PR's merge time) only changes up to then count: later rewrites of the branch don't undo a
 // review that was already completed into the merge result.
@@ -169,7 +170,7 @@ async function lastBaseChange(prNum: number, baseRef: string, until?: string): P
     if (at <= limit) last = Math.max(last, at);
   }
   const ref = encodeURIComponent(`refs/heads/${baseRef}`);
-  for (const type of ["force_push", "branch_deletion", "branch_creation"]) {
+  for (const type of ["force_push", "branch_deletion", "branch_creation", "push"]) {
     // /activity paginates with cursors, not `page`, so ghPaged would refetch the first page forever. Take the newest
     // page (newest first) and pick the latest entry at or before the limit.
     const perPage = until ? 100 : 1;
