@@ -76,7 +76,7 @@ type Commit = {
   commit: { message: string; verification?: { verified: boolean; reason: string } };
   files?: { filename: string; status: string; patch?: string }[];
 };
-type Review = { user: { login: string } | null; state: string; commit_id: string };
+type Review = { user: { login: string } | null; state: string; commit_id: string; submitted_at?: string };
 
 function parseVersion(v: string): [number, number, number] {
   const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(v.trim());
@@ -135,7 +135,33 @@ function canWrite(login: string): Promise<boolean> {
 
 // True when, among reviewers with write access (each one's latest decision), no change request is outstanding and
 // one has approved `headSha`.
-async function approvedAtCommit(prNum: number, headSha: string): Promise<boolean> {
+function memo<A extends unknown[], R>(key: (...args: A) => string, fn: (...args: A) => Promise<R>) {
+  const cache = new Map<string, Promise<R>>();
+  return (...args: A): Promise<R> => {
+    const k = key(...args);
+    let hit = cache.get(k);
+    if (!hit) {
+      hit = fn(...args);
+      cache.set(k, hit);
+    }
+    return hit;
+  };
+}
+
+// When the PR's base branch was last changed. An approval given before that covers a different comparison (the new
+// base may lack commits the reviewer saw as already merged, or the other way round), so it must not count.
+async function lastBaseChange(prNum: number): Promise<number> {
+  const events = await ghPaged<{ event: string; created_at?: string }>(`/issues/${prNum}/timeline`);
+  let last = 0;
+  for (const e of events) {
+    if (e.event === "base_ref_changed" && e.created_at) last = Math.max(last, Date.parse(e.created_at));
+  }
+  return last;
+}
+
+const approvedAtCommit = memo(
+  (prNum: number, headSha: string) => `${prNum}@${headSha}`,
+  async (prNum: number, headSha: string): Promise<boolean> => {
   const latest = new Map<string, Review>();
   for (const r of await ghPaged<Review>(`/pulls/${prNum}/reviews`)) {
     if (!r.user || (r.state !== "APPROVED" && r.state !== "CHANGES_REQUESTED" && r.state !== "DISMISSED")) continue;
@@ -147,25 +173,40 @@ async function approvedAtCommit(prNum: number, headSha: string): Promise<boolean
     if (await canWrite(r.user!.login)) states.push(r);
   }
   if (states.some((r) => r.state === "CHANGES_REQUESTED")) return false;
-  return states.some((r) => r.state === "APPROVED" && r.commit_id === headSha);
-}
+  const baseChangedAt = await lastBaseChange(prNum);
+  return states.some(
+    (r) =>
+      r.state === "APPROVED" &&
+      r.commit_id === headSha &&
+      (baseChangedAt === 0 || (r.submitted_at !== undefined && Date.parse(r.submitted_at) > baseChangedAt)),
+  );
+  },
+);
 
 // The approval covers the PR's own commits and the merge GitHub itself made (a verified web-flow commit); a merge
 // commit made any other way can carry changes nobody reviewed, so associated-PR membership alone is not enough.
 // An intermediate PR commit counts only while the approved final head is still in the checked history, so resetting
 // the branch to an earlier snapshot of the PR cannot reuse the approval.
-async function isAncestorOrSame(ancestor: string, head: string): Promise<boolean> {
-  if (ancestor === head) return true;
-  const cmp = await gh<{ status: string }>(`/compare/${ancestor}...${head}`);
-  return cmp.status === "ahead" || cmp.status === "identical";
-}
+const isAncestorOrSame = memo(
+  (ancestor: string, head: string) => `${ancestor}...${head}`,
+  async (ancestor: string, head: string): Promise<boolean> => {
+    if (ancestor === head) return true;
+    const cmp = await gh<{ status: string }>(`/compare/${ancestor}...${head}`);
+    return cmp.status === "ahead" || cmp.status === "identical";
+  },
+);
+
+const prCommitsOf = memo(
+  (prNum: number) => String(prNum),
+  (prNum: number) => ghPaged<{ sha: string }>(`/pulls/${prNum}/commits`),
+);
 
 async function isReviewedContent(sha: string, pr: Pull, releaseHead: string): Promise<boolean> {
   if (pr.merge_commit_sha === sha) {
     const c = await gh<Commit>(`/commits/${sha}`);
     if (c.committer?.login === "web-flow" && c.commit.verification?.verified === true) return true;
   }
-  const prCommits = await ghPaged<{ sha: string }>(`/pulls/${pr.number}/commits`);
+  const prCommits = await prCommitsOf(pr.number);
   if (!prCommits.some((c) => c.sha === sha)) {
     // GitHub caps this endpoint at 250 commits, so absence from a full list proves nothing. In that case fall back to
     // history: the commit must be in the approved head's ancestry (the caller already checked that the PR is associated).
@@ -175,7 +216,7 @@ async function isReviewedContent(sha: string, pr: Pull, releaseHead: string): Pr
 }
 
 async function reviewedIntoBranch(sha: string, branch: string, releaseHead: string): Promise<number | null> {
-  const pulls = await gh<Pull[]>(`/commits/${sha}/pulls`);
+  const pulls = await ghPaged<Pull>(`/commits/${sha}/pulls`);
   for (const pr of pulls) {
     if (!pr.merged_at || pr.base.ref !== branch) continue;
     if (!(await approvedAtCommit(pr.number, pr.head.sha))) continue;
