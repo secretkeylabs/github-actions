@@ -260,6 +260,12 @@ async function lastBaseChange(prNum: number, baseRef: string, headSha: string, u
         if (!e.timestamp || Date.parse(e.timestamp) > limit) continue;
         if ((type === "pr_merge" || type === "merge_queue_merge") && ownMergeSha && e.after === ownMergeSha) continue;
         if (integration) {
+          // Only history after the latest rewrite (force-push, deletion, recreation, retarget) is a linear interval
+          // with a monotonic merge base; older integrations can't matter, since an approval has to postdate `last`.
+          if (Date.parse(e.timestamp) <= last) {
+            url = undefined;
+            break;
+          }
           candidates.push(e);
           continue;
         }
@@ -267,7 +273,7 @@ async function lastBaseChange(prNum: number, baseRef: string, headSha: string, u
         found = true;
         break;
       }
-      if (found) break;
+      if (found || !url) break;
       url = until || integration ? page.next : undefined;
     }
     if (integration && candidates.length) {
@@ -351,8 +357,10 @@ async function isReviewedContent(sha: string, pr: Pull, releaseHead: string): Pr
       const m = await gh<Commit>(`/commits/${pr.merge_commit_sha}`);
       if (m.parents[0]) baseTips.push(m.parents[0].sha);
     }
+    const samePrCommits = await prCommitsOf(pr.number);
     for (const parent of own.parents.slice(1)) {
-      let trusted = await isOnSource(parent.sha);
+      // A branch merged inside the same PR is covered by the approved final diff.
+      let trusted = samePrCommits.some((c) => c.sha === parent.sha) || (await isOnSource(parent.sha));
       for (const tip of baseTips) {
         if (!trusted) trusted = await isAncestorOrSame(parent.sha, tip);
       }
