@@ -51,7 +51,14 @@ async function gh<T>(path: string): Promise<T> {
 }
 
 // One page plus the URL of the next one from the Link header (cursor-paginated endpoints have no `page` parameter).
-async function ghPage<T>(path: string): Promise<{ items: T[]; next?: string }> {
+// Memoized per URL for the run: every merged PR reads the same repository activity pages and applies its own time
+// boundary locally, so the pages are fetched once.
+const ghPage = memo(
+  (path: string) => path,
+  (path: string) => ghPageUncached<unknown>(path),
+) as <T>(path: string) => Promise<{ items: T[]; next?: string }>;
+
+async function ghPageUncached<T>(path: string): Promise<{ items: T[]; next?: string }> {
   const res = await fetch(path.startsWith("http") ? path : `${api}${path}`, {
     headers: {
       Authorization: `Bearer ${token}`,
@@ -361,6 +368,8 @@ async function isReviewedContent(sha: string, pr: Pull, releaseHead: string): Pr
     for (const parent of own.parents.slice(1)) {
       // A branch merged inside the same PR is covered by the approved final diff.
       let trusted = samePrCommits.some((c) => c.sha === parent.sha) || (await isOnSource(parent.sha));
+      // The commit list is capped at 250: absence from a full list proves nothing, so fall back to the approved head's ancestry.
+      if (!trusted && samePrCommits.length >= 250) trusted = await isAncestorOrSame(parent.sha, pr.head.sha);
       for (const tip of baseTips) {
         if (!trusted) trusted = await isAncestorOrSame(parent.sha, tip);
       }
