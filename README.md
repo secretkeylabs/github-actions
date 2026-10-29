@@ -52,9 +52,13 @@ Fails a release PR, or an rc publish, unless the release branch is safe to ship:
 
 - every commit it adds on top of the trusted source branches either came in through an approved PR into that release branch, or is a GitHub-verified `github-actions[bot]` commit that only changes allowed version lines (merge commits made with `-s ours` must change nothing);
 - the version file matches the version in the branch name (`release/v1.2.3`, `release/cli-v1.2.3`, `hotfix/v1.2.3`) and is higher than the target branch's version;
-- in `rc` mode, the PR is approved at its head commit.
+- in `rc` mode, the PR is still open and is approved at its head commit.
 
 Allowed-bot-changes patterns are matched per changed line, so anchor them to the exact indentation of the release version (a two-space `"version"` in `package.json`, not any `version` key such as `scripts.version`); for `.json` files the parsed before/after must also be identical except for the root `version` (and, in a lockfile, `packages[""].version` set to the same new version), so allow `package-lock.json` only for its two version lines, as in the example below. Commits that came in through a PR count as reviewed only if they are the PR's own commits or the verified merge GitHub made (rebase merges are not recognised). Source branches must therefore come into a release branch through a PR, not through the "Update branch" button or the web conflict editor: those create a merge authored by the user, which the guard fails as "not authored by github-actions[bot]".
+
+The guard counts an approval from any reviewer with write access at the head commit; it does not check who pushed that commit. Enable the branch protection rule "Require approval of the most recent reviewable push" on `release/**` and `hotfix/**` so a pusher cannot approve their own push to a colleague's PR.
+
+Callers pin the action by commit SHA and use the path `secretkeylabs/github-actions/.github/release-guard`; they must change their `uses:` path when they re-pin from the old location.
 
 For a PR into a release branch it only checks that the result carries the branch's version.
 

@@ -37,3 +37,8 @@ export function isTrustedMergeParent(opts: {
 }): boolean {
   return opts.inSamePr || opts.onSource || opts.inBaseTips;
 }
+
+// An rc may only be published from a PR that is still open: a closed or merged PR was cancelled or already shipped.
+export function isOpenPull(pr: { state: string; merged_at: string | null }): boolean {
+  return pr.state === "open" && pr.merged_at === null;
+}

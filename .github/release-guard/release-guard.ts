@@ -4,7 +4,7 @@
 // the version in the release branch name and is higher than the target branch's version.
 
 import { readFileSync } from "node:fs";
-import { isMalformedReleaseBranch, isTrustedMergeParent, onlyRootVersionChanged, RELEASE_BRANCH } from "./logic";
+import { isMalformedReleaseBranch, isOpenPull, isTrustedMergeParent, onlyRootVersionChanged, RELEASE_BRANCH } from "./logic";
 
 function eventHeadSha(): string {
   try {
@@ -548,6 +548,9 @@ async function main() {
       );
     }
 
+    if (mode === "rc" && !isOpenPull(pr)) {
+      failures.push(`PR #${pr.number} is ${pr.merged_at ? "merged" : pr.state}, refusing to publish an rc from a PR that is not open`);
+    }
     if (mode === "rc" && !(await approvedAtCommit(pr.number, pr.head.sha, pr.base.ref))) {
       failures.push(`PR #${pr.number} is not approved at its head commit ${pr.head.sha.slice(0, 8)}`);
     }

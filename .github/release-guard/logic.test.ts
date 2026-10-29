@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { isMalformedReleaseBranch, isTrustedMergeParent, onlyRootVersionChanged, RELEASE_BRANCH } from "./logic";
+import { isMalformedReleaseBranch, isOpenPull, isTrustedMergeParent, onlyRootVersionChanged, RELEASE_BRANCH } from "./logic";
 
 test("release branch names", () => {
   expect(RELEASE_BRANCH.exec("release/v1.2.3")?.[1]).toBe("1.2.3");
