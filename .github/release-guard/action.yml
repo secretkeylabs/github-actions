@@ -1,0 +1,50 @@
+name: "Release guard"
+description: "Fails a release PR or rc publish unless the release branch only adds reviewed commits and verified bot version bumps."
+
+inputs:
+  github-token:
+    description: "Token with contents and pull-requests read access. Approvals are filtered by reviewers' write access through the collaborator-permission endpoint; if it returns an error other than 404 for this token, the guard fails, so grant whatever that endpoint needs in your repository."
+    required: true
+  pr-number:
+    description: "The PR to check: a release PR (from release/* or hotfix/*) or a PR into a release branch."
+    required: true
+  mode:
+    description: "`pr` for the PR check, `rc` to also require an approval at the PR head (before publishing an rc)."
+    required: false
+    default: "pr"
+  version-file:
+    description: "package.json that carries the release version."
+    required: false
+    default: "package.json"
+  source-branches:
+    description: "Comma-separated branches whose commits are trusted (e.g. `develop,main`)."
+    required: true
+  expected-head-sha:
+    description: "Fail unless the PR head is this commit. Defaults to the head of the triggering pull_request event (also when passed empty); required in `rc` mode, so pass `github.sha` for other events."
+    required: false
+    default: ${{ github.event.pull_request.head.sha }}
+  allowed-bot-changes:
+    description: 'JSON object: file path -> list of regexes every added/removed line of a bot commit must match, e.g. {"package.json": ["^ {2}\"version\": \"\\d+\\.\\d+\\.\\d+\",?$"]}.'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      with:
+        bun-version: 1.4.0
+
+    - name: Run release guard
+      shell: bash
+      # Run from the action directory, not the caller's checkout, so its bunfig.toml (preloads) is never loaded.
+      working-directory: ${{ github.action_path }}
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        GUARD_MODE: ${{ inputs.mode }}
+        VERSION_FILE: ${{ inputs.version-file }}
+        SOURCE_BRANCHES: ${{ inputs.source-branches }}
+        ALLOWED_BOT_CHANGES: ${{ inputs.allowed-bot-changes }}
+        EXPECTED_HEAD_SHA: ${{ inputs.expected-head-sha }}
+      run: bun run release-guard.ts
