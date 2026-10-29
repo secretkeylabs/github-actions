@@ -128,9 +128,31 @@ function compareVersions(a: string, b: string): number {
   return 0;
 }
 
+// The raw media type returns the file body itself: the default JSON response omits `content` for files over 1 MB,
+// which large lockfiles routinely exceed. Bounded so a huge file cannot exhaust the runner's memory.
+const maxRawFileBytes = 50 * 1024 * 1024;
+
+async function rawFileAt(ref: string, file: string): Promise<string> {
+  const path = `/contents/${file.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`;
+  const res = await fetch(`${api}${path}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github.raw+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`GET ${path} -> ${res.status} ${await res.text()}`);
+  }
+  const length = Number(res.headers.get("content-length") ?? 0);
+  if (length > maxRawFileBytes) throw new Error(`${file} at ${ref} is larger than ${maxRawFileBytes} bytes`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.length > maxRawFileBytes) throw new Error(`${file} at ${ref} is larger than ${maxRawFileBytes} bytes`);
+  return buf.toString("utf8");
+}
+
 async function jsonAt(ref: string, file: string): Promise<unknown> {
-  const f = await gh<{ content: string }>(`/contents/${file.split("/").map(encodeURIComponent).join("/")}?ref=${encodeURIComponent(ref)}`);
-  return JSON.parse(Buffer.from(f.content, "base64").toString("utf8"));
+  return JSON.parse(await rawFileAt(ref, file));
 }
 
 // Line patterns cannot tell a root property from a nested one, so JSON files are compared parsed (see onlyRootVersionChanged).
@@ -143,8 +165,7 @@ async function jsonOnlyVersionChanged(file: string, sha: string, parent: string)
 }
 
 async function versionAt(ref: string): Promise<string> {
-  const file = await gh<{ content: string }>(`/contents/${versionFile}?ref=${encodeURIComponent(ref)}`);
-  const json = JSON.parse(Buffer.from(file.content, "base64").toString("utf8")) as { version?: string };
+  const json = (await jsonAt(ref, versionFile)) as { version?: string };
   if (!json.version) throw new Error(`${versionFile} at ${ref} has no version`);
   return json.version;
 }
