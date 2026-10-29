@@ -54,7 +54,7 @@ Fails a release PR, or an rc publish, unless the release branch is safe to ship:
 - the version file matches the version in the branch name (`release/v1.2.3`, `release/cli-v1.2.3`, `hotfix/v1.2.3`) and is higher than the target branch's version;
 - in `rc` mode, the PR is approved at its head commit.
 
-Allowed-bot-changes patterns are matched per changed line, so anchor them to the exact indentation of the release version (a two-space `"version"` in `package.json`, not any `version` key such as `scripts.version`); for `.json` files the parsed before/after must also be identical except for the root `version`, so a lockfile can't be allowed. Commits that came in through a PR count as reviewed only if they are the PR's own commits or the verified merge GitHub made (rebase merges are not recognised).
+Allowed-bot-changes patterns are matched per changed line, so anchor them to the exact indentation of the release version (a two-space `"version"` in `package.json`, not any `version` key such as `scripts.version`); for `.json` files the parsed before/after must also be identical except for the root `version` (and, in a lockfile, `packages[""].version` set to the same new version), so allow `package-lock.json` only for its two version lines, as in the example below. Commits that came in through a PR count as reviewed only if they are the PR's own commits or the verified merge GitHub made (rebase merges are not recognised).
 
 For a PR into a release branch it only checks that the result carries the branch's version.
 
@@ -69,7 +69,8 @@ For a PR into a release branch it only checks that the result carries the branch
     source-branches: develop,main
     allowed-bot-changes: |
       {
-        "package.json": ["^ {2}\"version\": \"\\d+\\.\\d+\\.\\d+\",?$"]
+        "package.json": ["^ {2}\"version\": \"\\d+\\.\\d+\\.\\d+\",?$"],
+        "package-lock.json": ["^ {2}\"version\": \"\\d+\\.\\d+\\.\\d+\",?$", "^ {6}\"version\": \"\\d+\\.\\d+\\.\\d+\",?$"]
       }
 ```
 
