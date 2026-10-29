@@ -82,5 +82,5 @@ For a PR into a release branch it only checks that the result carries the branch
 | `mode`                | `pr`, or `rc` to also require an approval at the PR head                                 | No       | `pr`           |
 | `version-file`        | `package.json` carrying the release version                                              | No       | `package.json` |
 | `source-branches`     | Comma-separated trusted branches                                                         | Yes      |                |
-| `expected-head-sha`   | Fail unless the PR head is this commit; defaults to the `pull_request` event head, required in `rc` mode (pass `github.sha`) | No | event head |
+| `expected-head-sha`   | Fail unless the PR head is this commit; defaults to the head of the triggering PR or PR-review event; pass `github.sha` only for `workflow_dispatch` or other events without a PR head | No | event head |
 | `allowed-bot-changes` | JSON: file path -> regexes every changed line of a bot commit must match                 | Yes      |                |
