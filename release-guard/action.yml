@@ -3,7 +3,7 @@ description: "Fails a release PR or rc publish unless the release branch only ad
 
 inputs:
   github-token:
-    description: "Token with contents and pull-requests read access."
+    description: "Token with contents and pull-requests read access. Approvals are filtered by reviewers' write access through the collaborator-permission endpoint; if it returns an error other than 404 for this token, the guard fails, so grant whatever that endpoint needs in your repository."
     required: true
   pr-number:
     description: "The PR to check: a release PR (from release/* or hotfix/*) or a PR into a release branch."
@@ -20,7 +20,7 @@ inputs:
     description: "Comma-separated branches whose commits are trusted (e.g. `develop,main`)."
     required: true
   expected-head-sha:
-    description: "Fail unless the PR head is this commit. Defaults to the head of the triggering pull_request event; required in `rc` mode, so pass `github.sha` for other events."
+    description: "Fail unless the PR head is this commit. Defaults to the head of the triggering pull_request event (also when passed empty); required in `rc` mode, so pass `github.sha` for other events."
     required: false
     default: ${{ github.event.pull_request.head.sha }}
   allowed-bot-changes:

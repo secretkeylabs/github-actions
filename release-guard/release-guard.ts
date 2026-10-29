@@ -3,6 +3,18 @@
 // GitHub-verified github-actions[bot] commit that only changes version lines. Also checks the version file matches
 // the version in the release branch name and is higher than the target branch's version.
 
+import { readFileSync } from "node:fs";
+import { isMalformedReleaseBranch, isTrustedMergeParent, onlyRootVersionChanged, RELEASE_BRANCH } from "./logic";
+
+function eventHeadSha(): string {
+  try {
+    const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")) as { pull_request?: { head?: { sha?: string } } };
+    return event.pull_request?.head?.sha ?? "";
+  } catch {
+    return "";
+  }
+}
+
 const token = process.env.GITHUB_TOKEN;
 const repoFullName = process.env.GITHUB_REPOSITORY;
 const prNumber = process.env.PR_NUMBER;
@@ -13,10 +25,11 @@ const sourceBranches = (process.env.SOURCE_BRANCHES || "")
   .map((b) => b.trim())
   .filter(Boolean);
 const allowedBotChangesJson = process.env.ALLOWED_BOT_CHANGES || "{}";
-const expectedHeadSha = process.env.EXPECTED_HEAD_SHA || "";
+// Callers pass an empty value on events without a PR head, which replaces the action's default: fall back to the
+// triggering pull_request event's head.
+const expectedHeadSha = process.env.EXPECTED_HEAD_SHA || eventHeadSha();
 
 const BOT_LOGIN = "github-actions[bot]";
-const RELEASE_BRANCH = /^(?:release|hotfix)\/(?:cli-)?v?(\d+\.\d+\.\d+)$/;
 
 if (!token || !repoFullName || !prNumber || sourceBranches.length === 0) {
   console.error("Missing GITHUB_TOKEN, GITHUB_REPOSITORY, PR_NUMBER or SOURCE_BRANCHES.");
@@ -120,15 +133,10 @@ async function jsonAt(ref: string, file: string): Promise<unknown> {
   return JSON.parse(Buffer.from(f.content, "base64").toString("utf8"));
 }
 
-// Line patterns cannot tell a root property from a nested one, so for JSON files the parsed before/after must be
-// identical except for the root `version` value.
+// Line patterns cannot tell a root property from a nested one, so JSON files are compared parsed (see onlyRootVersionChanged).
 async function jsonOnlyVersionChanged(file: string, sha: string, parent: string): Promise<boolean> {
   try {
-    const [before, after] = [await jsonAt(parent, file), await jsonAt(sha, file)] as Record<string, unknown>[];
-    if (typeof before !== "object" || typeof after !== "object" || !before || !after) return false;
-    const { version: bv, ...restBefore } = before;
-    const { version: av, ...restAfter } = after;
-    return typeof bv === "string" && typeof av === "string" && JSON.stringify(restBefore) === JSON.stringify(restAfter);
+    return onlyRootVersionChanged(await jsonAt(parent, file), await jsonAt(sha, file));
   } catch {
     return false;
   }
@@ -366,13 +374,14 @@ async function isReviewedContent(sha: string, pr: Pull, releaseHead: string): Pr
     }
     const samePrCommits = await prCommitsOf(pr.number);
     for (const parent of own.parents.slice(1)) {
-      // A branch merged inside the same PR is covered by the approved final diff.
-      let trusted = samePrCommits.some((c) => c.sha === parent.sha) || (await isOnSource(parent.sha));
-      // The commit list is capped at 250: absence from a full list proves nothing, so fall back to the approved head's ancestry.
-      if (!trusted && samePrCommits.length >= 250) trusted = await isAncestorOrSame(parent.sha, pr.head.sha);
+      // A branch merged inside the same PR is covered by the approved final diff. A capped (250) commit list proves
+      // nothing by absence, so it fails closed instead of widening trust through the head's ancestry.
+      let inBaseTips = false;
       for (const tip of baseTips) {
-        if (!trusted) trusted = await isAncestorOrSame(parent.sha, tip);
+        if (!inBaseTips) inBaseTips = await isAncestorOrSame(parent.sha, tip);
       }
+      const inSamePr = samePrCommits.some((c) => c.sha === parent.sha);
+      const trusted = isTrustedMergeParent({ inSamePr, onSource: !inSamePr && (await isOnSource(parent.sha)), inBaseTips });
       if (!trusted) return false;
     }
   }
@@ -521,6 +530,10 @@ async function main() {
     if (mode === "rc" && !(await approvedAtCommit(pr.number, pr.head.sha, pr.base.ref))) {
       failures.push(`PR #${pr.number} is not approved at its head commit ${pr.head.sha.slice(0, 8)}`);
     }
+  } else if (isMalformedReleaseBranch(pr.head.ref) || isMalformedReleaseBranch(pr.base.ref)) {
+    failures.push(
+      `PR #${pr.number} (${pr.head.ref} -> ${pr.base.ref}) uses a release/ or hotfix/ branch name without a plain x.y.z version, so it cannot be checked`,
+    );
   } else {
     console.log(`PR #${pr.number} (${pr.head.ref} -> ${pr.base.ref}) is not a release PR, nothing to check.`);
   }
