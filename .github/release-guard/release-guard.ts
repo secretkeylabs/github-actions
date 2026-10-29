@@ -4,7 +4,7 @@
 // the version in the release branch name and is higher than the target branch's version.
 
 import { readFileSync } from "node:fs";
-import { isMalformedReleaseBranch, isOpenPull, isTrustedMergeParent, onlyRootVersionChanged, RELEASE_BRANCH } from "./logic";
+import { isBotCommitter, isMalformedReleaseBranch, isOpenPull, isTrustedMergeParent, onlyRootVersionChanged, RELEASE_BRANCH } from "./logic";
 
 function eventHeadSha(): string {
   try {
@@ -456,7 +456,7 @@ async function botCommitProblems(sha: string): Promise<string[]> {
   if (allFiles.length >= 3000) return ["too many changed files to inspect"];
   c.files = allFiles;
   if (c.author?.login !== BOT_LOGIN) return [`not authored by ${BOT_LOGIN} (source branches must come in through a PR into the release branch, not via "Update branch" or the web conflict editor)`];
-  if (c.committer?.login !== BOT_LOGIN) return [`not committed by ${BOT_LOGIN}`];
+  if (!isBotCommitter(c.committer?.login, BOT_LOGIN)) return [`not committed by ${BOT_LOGIN} or web-flow`];
   if (!c.commit.verification?.verified) {
     return [`signature not verified (${c.commit.verification?.reason ?? "unknown"})`];
   }

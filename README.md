@@ -50,7 +50,7 @@ Prepends a package's pre-release installation instructions to a Pull Request des
 
 Fails a release PR, or an rc publish, unless the release branch is safe to ship:
 
-- every commit it adds on top of the trusted source branches either came in through an approved PR into that release branch, or is a GitHub-verified `github-actions[bot]` commit that only changes allowed version lines (merge commits made with `-s ours` must change nothing);
+- every commit it adds on top of the trusted source branches either came in through an approved PR into that release branch, or is a GitHub-verified commit authored by `github-actions[bot]` (committed by it, or by `web-flow` when it was created through the REST API) that only changes allowed version lines (merge commits made with `-s ours` must change nothing);
 - the version file matches the version in the branch name (`release/v1.2.3`, `release/cli-v1.2.3`, `hotfix/v1.2.3`) and is higher than the target branch's version;
 - in `rc` mode, the PR is still open and is approved at its head commit.
 

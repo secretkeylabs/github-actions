@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { isMalformedReleaseBranch, isOpenPull, isTrustedMergeParent, onlyRootVersionChanged, RELEASE_BRANCH } from "./logic";
+import { isBotCommitter, isMalformedReleaseBranch, isOpenPull, isTrustedMergeParent, onlyRootVersionChanged, RELEASE_BRANCH } from "./logic";
 
 test("release branch names", () => {
   expect(RELEASE_BRANCH.exec("release/v1.2.3")?.[1]).toBe("1.2.3");
@@ -36,4 +36,12 @@ test("merge parents are trusted only when on a source, in the same PR or in the 
   expect(isTrustedMergeParent({ inSamePr: true, onSource: false, inBaseTips: false })).toBe(true);
   expect(isTrustedMergeParent({ inSamePr: false, onSource: true, inBaseTips: false })).toBe(true);
   expect(isTrustedMergeParent({ inSamePr: false, onSource: false, inBaseTips: true })).toBe(true);
+});
+
+test("bot commits are committed by the bot or, when created through the API, by web-flow", () => {
+  const bot = "github-actions[bot]";
+  expect(isBotCommitter(bot, bot)).toBe(true);
+  expect(isBotCommitter("web-flow", bot)).toBe(true);
+  expect(isBotCommitter("someone", bot)).toBe(false);
+  expect(isBotCommitter(undefined, bot)).toBe(false);
 });
