@@ -62,7 +62,7 @@ For a PR into a release branch it only checks that the result carries the branch
 
 ```yaml
 - name: Release guard
-  uses: secretkeylabs/github-actions/release-guard@main
+  uses: secretkeylabs/github-actions/.github/release-guard@main
   with:
     github-token: ${{ secrets.GITHUB_TOKEN }}
     pr-number: ${{ github.event.pull_request.number }}
