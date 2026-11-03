@@ -55,11 +55,13 @@ const api = `https://api.github.com/repos/${repoFullName}`;
 // REST call per question made the guard take minutes on releases with many commits. The clone holds commits only (no
 // trees or blobs) and nothing from it is checked out or executed. Every local answer falls back to the REST API when
 // the clone is unavailable or a commit can't be fetched, so a git failure costs time, never a different verdict.
-const gitDir = mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), "release-guard-"));
+let gitDir = "";
 // The token goes through git's environment config, not argv, so it doesn't show up in the process list.
 const gitEnv = {
   ...process.env,
   GIT_TERMINAL_PROMPT: "0",
+  // A missing commit must fail `cat-file`, not trigger a promisor lazy fetch that pulls its whole history outside the queue.
+  GIT_NO_LAZY_FETCH: "1",
   GIT_CONFIG_COUNT: "1",
   GIT_CONFIG_KEY_0: "http.extraHeader",
   GIT_CONFIG_VALUE_0: `Authorization: basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`,
@@ -67,22 +69,34 @@ const gitEnv = {
 let gitReady = false;
 
 async function git(args: string[]): Promise<{ code: number; out: string }> {
-  const proc = Bun.spawn(["git", "--git-dir", gitDir, ...args], { env: gitEnv, stdout: "pipe", stderr: "ignore" });
-  const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-  return { code, out: out.trim() };
+  try {
+    const proc = Bun.spawn(["git", "--git-dir", gitDir, ...args], { env: gitEnv, stdout: "pipe", stderr: "ignore" });
+    const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    return { code, out: out.trim() };
+  } catch {
+    // git isn't installed or can't start: callers fall back to the REST API.
+    return { code: -1, out: "" };
+  }
 }
 
 const fetchArgs = ["fetch", "--quiet", "--no-tags", "--filter=tree:0", "origin"];
 // Concurrent fetches into one repository contend for its lock files, so they run one at a time.
 let fetchQueue: Promise<unknown> = Promise.resolve();
 function fetchCommits(shas: string[]): Promise<{ code: number; out: string }> {
-  const run = fetchQueue.then(() => git([...fetchArgs, ...shas]));
+  // Fetching into refs lets later fetches negotiate against what is already here instead of re-downloading the history.
+  const run = fetchQueue.then(() => git([...fetchArgs, ...shas.map((sha) => `${sha}:refs/guard/${sha}`)]));
   fetchQueue = run.catch(() => undefined);
   return run;
 }
 
 async function initGit(tips: string[]): Promise<void> {
   const server = process.env.GITHUB_SERVER_URL || "https://github.com";
+  try {
+    gitDir = mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), "release-guard-"));
+  } catch {
+    console.log("Local commit graph unavailable, using the REST API for ancestry checks.");
+    return;
+  }
   const init = await git(["init", "--quiet", "--bare"]);
   const remote = init.code === 0 && (await git(["remote", "add", "origin", `${server}/${repoFullName}.git`]));
   const fetched = remote && remote.code === 0 && (await fetchCommits(tips));
@@ -396,20 +410,28 @@ async function lastBaseChange(prNum: number, baseRef: string, headSha: string, u
   return last;
 }
 
-const approvedAtCommit = memo(
-  (prNum: number, headSha: string, baseRef: string, mergedAt?: string, mergeSha?: string) =>
-    `${prNum}@${headSha}@${baseRef}@${mergedAt ?? ""}@${mergeSha ?? ""}`,
-  async (prNum: number, headSha: string, baseRef: string, mergedAt?: string, mergeSha?: string): Promise<boolean> => {
+// The latest counted review (approved, changes requested, dismissed) per reviewer, split by write access. Only writers
+// count, for vetoes as well as approvals; `others` lists the logins of non-writers who approved.
+async function writerReviews(prNum: number): Promise<{ writers: Review[]; others: string[] }> {
   const latest = new Map<string, Review>();
   for (const r of await ghPaged<Review>(`/pulls/${prNum}/reviews`)) {
     if (!r.user || (r.state !== "APPROVED" && r.state !== "CHANGES_REQUESTED" && r.state !== "DISMISSED")) continue;
     latest.set(r.user.login, r);
   }
-  // Only reviewers with write access count, for vetoes as well as approvals.
-  const states: Review[] = [];
+  const writers: Review[] = [];
+  const others: string[] = [];
   for (const r of latest.values()) {
-    if (await canWrite(r.user!.login)) states.push(r);
+    if (await canWrite(r.user!.login)) writers.push(r);
+    else if (r.state === "APPROVED") others.push(r.user!.login);
   }
+  return { writers, others };
+}
+
+const approvedAtCommit = memo(
+  (prNum: number, headSha: string, baseRef: string, mergedAt?: string, mergeSha?: string) =>
+    `${prNum}@${headSha}@${baseRef}@${mergedAt ?? ""}@${mergeSha ?? ""}`,
+  async (prNum: number, headSha: string, baseRef: string, mergedAt?: string, mergeSha?: string): Promise<boolean> => {
+  const { writers: states } = await writerReviews(prNum);
   if (states.some((r) => r.state === "CHANGES_REQUESTED")) return false;
   const baseChangedAt = await lastBaseChange(prNum, baseRef, headSha, mergedAt, mergeSha);
   return states.some(
@@ -423,23 +445,15 @@ const approvedAtCommit = memo(
 
 // Why `approvedAtCommit` failed, in words a release manager can act on. Only for the failure message: it never decides.
 async function approvalProblem(prNum: number, headSha: string, baseRef: string): Promise<string> {
-  const latest = new Map<string, Review>();
-  for (const r of await ghPaged<Review>(`/pulls/${prNum}/reviews`)) {
-    if (!r.user || (r.state !== "APPROVED" && r.state !== "CHANGES_REQUESTED" && r.state !== "DISMISSED")) continue;
-    latest.set(r.user.login, r);
-  }
-  const writers: Review[] = [];
-  const others: string[] = [];
-  for (const r of latest.values()) {
-    if (await canWrite(r.user!.login)) writers.push(r);
-    else if (r.state === "APPROVED") others.push(r.user!.login);
-  }
+  const { writers, others } = await writerReviews(prNum);
   const short = (sha: string) => sha.slice(0, 8);
   const reasons: string[] = [];
   const vetoes = writers.filter((r) => r.state === "CHANGES_REQUESTED").map((r) => r.user!.login);
   if (vetoes.length) reasons.push(`changes requested by ${vetoes.join(", ")}`);
+  const changedAt = await lastBaseChange(prNum, baseRef, headSha);
   for (const r of writers.filter((r) => r.state === "APPROVED" && r.commit_id === headSha)) {
-    const changedAt = await lastBaseChange(prNum, baseRef, headSha);
+    // Same freshness test as `approvedAtCommit`; otherwise the approval is fine and something else (a veto) is the problem.
+    if (!(changedAt > 0 && (!r.submitted_at || Date.parse(r.submitted_at) <= changedAt))) continue;
     reasons.push(
       `${r.user!.login}'s approval predates a change to ${baseRef} at ${new Date(changedAt).toISOString()} (retarget, force-push, or a merge that moved the merge base), so it covers a different diff`,
     );
