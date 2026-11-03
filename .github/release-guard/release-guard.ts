@@ -182,7 +182,7 @@ type Commit = {
   commit: { message: string; verification?: { verified: boolean; reason: string } };
   files?: { filename: string; status: string; patch?: string }[];
 };
-type Review = { user: { login: string } | null; state: string; commit_id: string; submitted_at?: string };
+type Review = { id?: number; user: { login: string } | null; state: string; commit_id: string; submitted_at?: string };
 
 function parseVersion(v: string): [number, number, number] {
   const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(v.trim());
@@ -421,6 +421,53 @@ const approvedAtCommit = memo(
   },
 );
 
+// Why `approvedAtCommit` failed, in words a release manager can act on. Only for the failure message: it never decides.
+async function approvalProblem(prNum: number, headSha: string, baseRef: string): Promise<string> {
+  const latest = new Map<string, Review>();
+  for (const r of await ghPaged<Review>(`/pulls/${prNum}/reviews`)) {
+    if (!r.user || (r.state !== "APPROVED" && r.state !== "CHANGES_REQUESTED" && r.state !== "DISMISSED")) continue;
+    latest.set(r.user.login, r);
+  }
+  const writers: Review[] = [];
+  const others: string[] = [];
+  for (const r of latest.values()) {
+    if (await canWrite(r.user!.login)) writers.push(r);
+    else if (r.state === "APPROVED") others.push(r.user!.login);
+  }
+  const short = (sha: string) => sha.slice(0, 8);
+  const reasons: string[] = [];
+  const vetoes = writers.filter((r) => r.state === "CHANGES_REQUESTED").map((r) => r.user!.login);
+  if (vetoes.length) reasons.push(`changes requested by ${vetoes.join(", ")}`);
+  for (const r of writers.filter((r) => r.state === "APPROVED" && r.commit_id === headSha)) {
+    const changedAt = await lastBaseChange(prNum, baseRef, headSha);
+    reasons.push(
+      `${r.user!.login}'s approval predates a change to ${baseRef} at ${new Date(changedAt).toISOString()} (retarget, force-push, or a merge that moved the merge base), so it covers a different diff`,
+    );
+  }
+  const dismissed = writers.filter((r) => r.state === "DISMISSED");
+  if (dismissed.length) {
+    // GitHub records why it dismissed a review only in the timeline.
+    const messages = new Map<number, string>();
+    for (const e of await ghPaged<{ event: string; dismissed_review?: { review_id: number; dismissal_message?: string | null } }>(
+      `/issues/${prNum}/timeline`,
+    )) {
+      if (e.event === "review_dismissed" && e.dismissed_review?.dismissal_message) {
+        messages.set(e.dismissed_review.review_id, e.dismissed_review.dismissal_message);
+      }
+    }
+    for (const r of dismissed) {
+      const why = (r.id !== undefined && messages.get(r.id)) || "a new push or a merge-base change";
+      reasons.push(`${r.user!.login}'s approval at ${short(r.commit_id)} was dismissed (${why.replace(/\.$/, "")})`);
+    }
+  }
+  for (const r of writers.filter((r) => r.state === "APPROVED" && r.commit_id !== headSha)) {
+    reasons.push(`${r.user!.login} approved an older commit, ${short(r.commit_id)}`);
+  }
+  if (others.length) reasons.push(`approvals from ${others.join(", ")} don't count (no write access)`);
+  if (!reasons.length) reasons.push("nobody with write access has approved it");
+  return reasons.join("; ");
+}
+
 // The approval covers the PR's own commits and the merge GitHub itself made (a verified web-flow commit); a merge
 // commit made any other way can carry changes nobody reviewed, so associated-PR membership alone is not enough.
 // An intermediate PR commit counts only while the approved final head is still in the checked history, so resetting
@@ -642,7 +689,10 @@ async function main() {
       failures.push(`PR #${pr.number} is ${pr.merged_at ? "merged" : pr.state}, refusing to publish an rc from a PR that is not open`);
     }
     if (mode === "rc" && !(await approvedAtCommit(pr.number, pr.head.sha, pr.base.ref))) {
-      failures.push(`PR #${pr.number} is not approved at its head commit ${pr.head.sha.slice(0, 8)}`);
+      failures.push(
+        `PR #${pr.number} is not approved at its head commit ${pr.head.sha.slice(0, 8)}: ${await approvalProblem(pr.number, pr.head.sha, pr.base.ref)}. ` +
+          `An rc is published only when someone with write access approves the release PR at its current head; approve it again to retry.`,
+      );
     }
   } else if (isMalformedReleaseBranch(pr.head.ref) || isMalformedReleaseBranch(pr.base.ref)) {
     failures.push(
