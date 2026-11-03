@@ -3,7 +3,9 @@
 // GitHub-verified github-actions[bot] commit that only changes version lines. Also checks the version file matches
 // the version in the release branch name and is higher than the target branch's version.
 
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { isBotCommitter, isMalformedReleaseBranch, isOpenPull, isTrustedMergeParent, onlyRootVersionChanged, RELEASE_BRANCH } from "./logic";
 
 function eventHeadSha(): string {
@@ -48,6 +50,74 @@ const allowedBotChanges = Object.fromEntries(
 );
 
 const api = `https://api.github.com/repos/${repoFullName}`;
+
+// Commit-graph questions (ancestry, merge bases, the first-parent chain) are answered from a local treeless clone: one
+// REST call per question made the guard take minutes on releases with many commits. The clone holds commits only (no
+// trees or blobs) and nothing from it is checked out or executed. Every local answer falls back to the REST API when
+// the clone is unavailable or a commit can't be fetched, so a git failure costs time, never a different verdict.
+const gitDir = mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), "release-guard-"));
+// The token goes through git's environment config, not argv, so it doesn't show up in the process list.
+const gitEnv = {
+  ...process.env,
+  GIT_TERMINAL_PROMPT: "0",
+  GIT_CONFIG_COUNT: "1",
+  GIT_CONFIG_KEY_0: "http.extraHeader",
+  GIT_CONFIG_VALUE_0: `Authorization: basic ${Buffer.from(`x-access-token:${token}`).toString("base64")}`,
+};
+let gitReady = false;
+
+async function git(args: string[]): Promise<{ code: number; out: string }> {
+  const proc = Bun.spawn(["git", "--git-dir", gitDir, ...args], { env: gitEnv, stdout: "pipe", stderr: "ignore" });
+  const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  return { code, out: out.trim() };
+}
+
+const fetchArgs = ["fetch", "--quiet", "--no-tags", "--filter=tree:0", "origin"];
+// Concurrent fetches into one repository contend for its lock files, so they run one at a time.
+let fetchQueue: Promise<unknown> = Promise.resolve();
+function fetchCommits(shas: string[]): Promise<{ code: number; out: string }> {
+  const run = fetchQueue.then(() => git([...fetchArgs, ...shas]));
+  fetchQueue = run.catch(() => undefined);
+  return run;
+}
+
+async function initGit(tips: string[]): Promise<void> {
+  const server = process.env.GITHUB_SERVER_URL || "https://github.com";
+  const init = await git(["init", "--quiet", "--bare"]);
+  const remote = init.code === 0 && (await git(["remote", "add", "origin", `${server}/${repoFullName}.git`]));
+  const fetched = remote && remote.code === 0 && (await fetchCommits(tips));
+  gitReady = !!fetched && fetched.code === 0;
+  if (!gitReady) console.log("Local commit graph unavailable, using the REST API for ancestry checks.");
+}
+
+// A commit outside the fetched history (e.g. a squash-merged PR's head) is fetched on demand.
+const hasCommit = memo(
+  (sha: string) => sha,
+  async (sha: string): Promise<boolean> => {
+    if (!gitReady || !/^[0-9a-f]{40}$/.test(sha)) return false;
+    if ((await git(["cat-file", "-e", `${sha}^{commit}`])).code === 0) return true;
+    if ((await fetchCommits([sha])).code !== 0) return false;
+    return (await git(["cat-file", "-e", `${sha}^{commit}`])).code === 0;
+  },
+);
+
+async function haveCommits(shas: string[]): Promise<boolean> {
+  return (await Promise.all(shas.map(hasCommit))).every(Boolean);
+}
+
+// Runs `fn` over `items` with at most `limit` in flight, keeping the results in input order.
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
 
 async function gh<T>(path: string): Promise<T> {
   const res = await fetch(path.startsWith("http") ? path : `${api}${path}`, {
@@ -244,6 +314,12 @@ function memo<A extends unknown[], R>(key: (...args: A) => string, fn: (...args:
 const mergeBaseWith = memo(
   (head: string, other: string) => `${other}...${head}`,
   async (head: string, other: string): Promise<string | undefined> => {
+    // All merge bases, sorted: with criss-cross history git and the API may each pick a different one of several, and
+    // callers only compare results for equality. A mix of a local and an API answer can then only read as "changed".
+    if (await haveCommits([head, other])) {
+      const local = await git(["merge-base", "--all", other, head]);
+      if (local.code === 0 && local.out) return local.out.split("\n").sort().join(",");
+    }
     try {
       return (await gh<{ merge_base_commit?: { sha: string } }>(`/compare/${other}...${head}`)).merge_base_commit?.sha;
     } catch {
@@ -353,6 +429,12 @@ const isAncestorOrSame = memo(
   (ancestor: string, head: string) => `${ancestor}...${head}`,
   async (ancestor: string, head: string): Promise<boolean> => {
     if (ancestor === head) return true;
+    if (await haveCommits([ancestor, head])) {
+      // 0: ancestor, 1: not an ancestor, anything else: an error, answered by the API instead.
+      const local = await git(["merge-base", "--is-ancestor", ancestor, head]);
+      if (local.code === 0) return true;
+      if (local.code === 1) return false;
+    }
     const cmp = await gh<{ status: string }>(`/compare/${ancestor}...${head}`);
     return cmp.status === "ahead" || cmp.status === "identical";
   },
@@ -368,6 +450,13 @@ const prCommitsOf = memo(
 const firstParentChain = memo(
   (head: string) => head,
   async (head: string): Promise<Set<string>> => {
+    // Every ancestor of a commit on a source branch is on it too, so the walk below stops exactly where the first-parent
+    // commits stop being "not reachable from any source", which is what this rev-list lists.
+    const sources = await Promise.all(sourceBranches.map(sourceSha));
+    if (await haveCommits([head, ...sources])) {
+      const local = await git(["rev-list", "--first-parent", head, "--not", ...sources]);
+      if (local.code === 0) return new Set(local.out ? local.out.split("\n") : []);
+    }
     const chain = new Set<string>();
     let cur: string | undefined = head;
     while (cur && !chain.has(cur) && !(await isOnSource(cur))) {
@@ -529,23 +618,24 @@ async function main() {
       failures.push(`version ${headVersion} is not higher than ${pr.base.ref}'s ${baseVersion}`);
     }
 
+    await initGit([pr.head.sha, ...(await Promise.all(sourceBranches.map(sourceSha)))]);
     const extra = await commitsNotOnSources(pr.head.sha);
     console.log(`${extra.length} commit(s) on ${pr.head.ref} are not on ${sourceBranches.join(" or ")}`);
-    for (const c of extra) {
+    // Commits are independent, so they are checked concurrently (the memoized lookups dedupe shared requests); the
+    // results are reported in branch order.
+    const verdicts = await mapLimit(extra, 6, async (c): Promise<{ ok?: string; failure?: string }> => {
       const subject = c.commit.message.split("\n")[0];
       const reviewedIn = await reviewedIntoBranch(c.sha, pr.head.ref, pr.head.sha);
-      if (reviewedIn) {
-        console.log(`ok  ${c.sha.slice(0, 8)} ${subject} (approved PR #${reviewedIn})`);
-        continue;
-      }
+      if (reviewedIn) return { ok: `ok  ${c.sha.slice(0, 8)} ${subject} (approved PR #${reviewedIn})` };
       const problems = await botCommitProblems(c.sha);
-      if (problems.length === 0) {
-        console.log(`ok  ${c.sha.slice(0, 8)} ${subject} (verified bot version bump)`);
-        continue;
-      }
-      failures.push(
-        `${c.sha.slice(0, 8)} ${subject}: not from an approved PR into ${pr.head.ref}, and as a bot commit: ${problems.join("; ")}`,
-      );
+      if (problems.length === 0) return { ok: `ok  ${c.sha.slice(0, 8)} ${subject} (verified bot version bump)` };
+      return {
+        failure: `${c.sha.slice(0, 8)} ${subject}: not from an approved PR into ${pr.head.ref}, and as a bot commit: ${problems.join("; ")}`,
+      };
+    });
+    for (const v of verdicts) {
+      if (v.ok) console.log(v.ok);
+      else failures.push(v.failure!);
     }
 
     if (mode === "rc" && !isOpenPull(pr)) {
